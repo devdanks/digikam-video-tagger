@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "digikam-video-tagger"
+version = "0.1.0"
+description = "GPU-assisted video tagging that exchanges metadata safely with digiKam"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "devdanks" }]
+keywords = ["digikam", "video", "face-recognition", "ffmpeg", "xmp"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Video",
+]
+dependencies = [
+  "numpy>=2.0,<3",
+  "opencv-python-headless>=4.10,<5",
+  "PyMySQL>=1.1,<2",
+]
+
+[project.urls]
+Homepage = "https://github.com/devdanks/digikam-video-tagger"
+Repository = "https://github.com/devdanks/digikam-video-tagger"
+Issues = "https://github.com/devdanks/digikam-video-tagger/issues"
+
+[project.scripts]
+digikam-video-tagger = "digikam_video_tagger.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/digikam_video_tagger"]

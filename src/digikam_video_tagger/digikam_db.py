@@ -22,6 +22,7 @@ class CatalogFrameFaces:
     frame: Path
     image_id: int | None
     person_tag_paths: tuple[str, ...]
+    catalogued: bool = True
 
 
 class DigiKamFaceGallery:
@@ -59,14 +60,16 @@ class DigiKamFaceGallery:
             cursor.execute("SELECT id, attribute, value FROM IdentityAttributes")
             attributes: dict[int, dict[str, str]] = {}
             for identity_id, attribute, value in cursor.fetchall():
-                attributes.setdefault(int(identity_id), {})[str(attribute)] = str(value or "")
+                attributes.setdefault(int(identity_id), {})[str(attribute)] = str(
+                    value or ""
+                )
 
             cursor.execute("SELECT identity, embedding FROM FaceMatrices")
             gallery: list[PersonEmbedding] = []
             for identity_id, blob in cursor.fetchall():
                 identity_id = int(identity_id)
                 attrs = attributes.get(identity_id, {})
-                name = attrs.get("fullName") or attrs.get("name") or attrs.get("faceEngineName")
+                name = attrs.get("fullName") or attrs.get("name")
                 if not name or not blob:
                     continue
                 vector = np.frombuffer(blob, dtype="<f4").astype(np.float32, copy=True)
@@ -101,7 +104,10 @@ class DigiKamCatalog:
 
     @staticmethod
     def _filesystem_root(frame: Path, specific_path: str) -> Path:
-        normalized = specific_path.replace("/", os.sep).lstrip("\\/")
+        root = Path(specific_path.replace("/", os.sep))
+        if root.is_absolute():
+            return root
+        normalized = str(root).lstrip("\\/")
         return Path(f"{frame.drive}{os.sep}{normalized}")
 
     @staticmethod
@@ -118,7 +124,9 @@ class DigiKamCatalog:
 
     @staticmethod
     def _tag_paths(rows: list[tuple[int, int, str]]) -> dict[int, str]:
-        tags = {int(tag_id): (int(parent_id), str(name)) for tag_id, parent_id, name in rows}
+        tags = {
+            int(tag_id): (int(parent_id), str(name)) for tag_id, parent_id, name in rows
+        }
         cache: dict[int, str] = {}
 
         def build(tag_id: int, visiting: set[int] | None = None) -> str:
@@ -145,8 +153,11 @@ class DigiKamCatalog:
             return []
 
         with self._connect() as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT id, specificPath FROM albumroots WHERE status=0")
-            roots = [(int(root_id), str(specific_path)) for root_id, specific_path in cursor.fetchall()]
+            cursor.execute("SELECT id, specificPath FROM AlbumRoots WHERE status=0")
+            roots = [
+                (int(root_id), str(specific_path))
+                for root_id, specific_path in cursor.fetchall()
+            ]
 
             locations: dict[Path, tuple[int, str] | None] = {}
             for frame in normalized_frames:
@@ -171,32 +182,40 @@ class DigiKamCatalog:
             for (root_id, album_path), grouped_frames in grouped.items():
                 placeholders = ",".join(["%s"] * len(grouped_frames))
                 cursor.execute(
-                    "SELECT i.id, i.name FROM images i "
-                    "JOIN albums a ON a.id=i.album "
+                    "SELECT i.id, i.name FROM Images i "
+                    "JOIN Albums a ON a.id=i.album "
                     f"WHERE a.albumRoot=%s AND a.relativePath=%s AND i.name IN ({placeholders})",
                     (root_id, album_path, *(frame.name for frame in grouped_frames)),
                 )
-                by_name = {str(name).casefold(): int(image_id) for image_id, name in cursor.fetchall()}
+                by_name = {
+                    str(name).casefold(): int(image_id)
+                    for image_id, name in cursor.fetchall()
+                }
                 for frame in grouped_frames:
                     image_id = by_name.get(frame.name.casefold())
                     if image_id is not None:
                         image_ids[frame] = image_id
 
-            cursor.execute("SELECT id, pid, name FROM tags")
+            cursor.execute("SELECT id, pid, name FROM Tags")
             paths = self._tag_paths(
-                [(int(tag_id), int(parent_id), str(name)) for tag_id, parent_id, name in cursor.fetchall()]
+                [
+                    (int(tag_id), int(parent_id), str(name))
+                    for tag_id, parent_id, name in cursor.fetchall()
+                ]
             )
 
-            faces_by_id: dict[int, set[str]] = {image_id: set() for image_id in image_ids.values()}
+            faces_by_id: dict[int, set[str]] = {
+                image_id: set() for image_id in image_ids.values()
+            }
             if faces_by_id:
                 placeholders = ",".join(["%s"] * len(faces_by_id))
                 cursor.execute(
                     "SELECT DISTINCT itp.imageid, itp.tagid "
-                    "FROM imagetagproperties itp "
-                    "JOIN tagproperties person ON person.tagid=itp.tagid AND person.property='person' "
+                    "FROM ImageTagProperties itp "
+                    "JOIN TagProperties person ON person.tagid=itp.tagid AND person.property='person' "
                     "WHERE itp.property='tagRegion' "
                     "AND NOT EXISTS ("
-                    "  SELECT 1 FROM tagproperties special "
+                    "  SELECT 1 FROM TagProperties special "
                     "  WHERE special.tagid=itp.tagid "
                     "  AND special.property IN ('unknownPerson','unconfirmedPerson','ignoredPerson')"
                     ") "
@@ -212,7 +231,13 @@ class DigiKamCatalog:
             CatalogFrameFaces(
                 frame=frame,
                 image_id=image_ids.get(frame),
-                person_tag_paths=tuple(sorted(faces_by_id.get(image_ids.get(frame, -1), set()), key=str.casefold)),
+                person_tag_paths=tuple(
+                    sorted(
+                        faces_by_id.get(image_ids.get(frame, -1), set()),
+                        key=str.casefold,
+                    )
+                ),
+                catalogued=locations[frame] is not None,
             )
             for frame in normalized_frames
         ]
@@ -221,8 +246,8 @@ class DigiKamCatalog:
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT "
-                "(SELECT COUNT(*) FROM imagetagproperties WHERE property='tagRegion'),"
-                "(SELECT COUNT(DISTINCT tagid) FROM tagproperties WHERE property='person'),"
+                "(SELECT COUNT(*) FROM ImageTagProperties WHERE property='tagRegion'),"
+                "(SELECT COUNT(DISTINCT tagid) FROM TagProperties WHERE property='person'),"
                 "(SELECT COUNT(*) FROM information_schema.TABLES "
                 " WHERE TABLE_SCHEMA=%s AND LOWER(TABLE_NAME)='facematrices')",
                 (self.config.database,),
@@ -230,6 +255,6 @@ class DigiKamCatalog:
             regions, people, has_matrices = cursor.fetchone()
             embeddings = 0
             if has_matrices:
-                cursor.execute("SELECT COUNT(*) FROM facematrices")
+                cursor.execute("SELECT COUNT(*) FROM FaceMatrices")
                 embeddings = int(cursor.fetchone()[0])
             return int(regions), int(people), embeddings

@@ -9,6 +9,7 @@ from .evidence import EvidenceAccumulator, TagEvidence
 from .ffmpeg import FFmpegSampler, VideoInfo
 from .metadata import ExifToolSidecarWriter, MetadataWriteResult
 from .models import FaceTagger, YoloObjectTagger
+from .tags import contains_faces_tag, object_tag, people_tag
 
 
 @dataclass(frozen=True)
@@ -87,12 +88,14 @@ class VideoTaggingPipeline:
             min_hits=self.min_person_hits,
             min_frame_ratio=self.min_frame_ratio,
         )
-        tags = [f"{self.tag_root}/Objects/{item.label}" for item in objects]
+        tags = [object_tag(self.tag_root, item.label) for item in objects]
         if face_frames:
-            tags.append(f"{self.tag_root}/Contains Faces")
-        tags.extend(f"People/{item.label}" for item in people)
+            tags.append(contains_faces_tag(self.tag_root))
+        tags.extend(people_tag(item.label) for item in people)
 
-        metadata = self.sidecar_writer.write_tags(video, tags) if apply and tags else None
+        metadata = (
+            self.sidecar_writer.write_tags(video, tags) if apply and tags else None
+        )
         return AnalysisResult(
             video=video,
             info=info,

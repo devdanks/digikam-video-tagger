@@ -26,6 +26,8 @@ jobs:
         run: uv sync --locked --dev
       - name: Compile
         run: uv run python -m compileall -q src tests
+      - name: Lint and format check
+        run: uv run ruff check . && uv run ruff format --check .
       - name: Test
         run: uv run pytest
       - name: Build

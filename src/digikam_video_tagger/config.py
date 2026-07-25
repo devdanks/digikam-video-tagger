@@ -29,9 +29,7 @@ def _command_path(*names: str) -> Path | None:
     return None
 
 
-LOCAL_APP_DATA = Path(
-    os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")
-)
+LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
 DISCOVERED_FFMPEG = _command_path("ffmpeg.exe", "ffmpeg")
 DISCOVERED_EXIFTOOL = _command_path("exiftool.exe", "exiftool")
 
@@ -51,11 +49,9 @@ DEFAULT_DIGIKAM_CONFIG = _environment_path(
     "DIGIKAM_VIDEO_TAGGER_DIGIKAM_CONFIG",
     LOCAL_APP_DATA / "digikamrc",
 )
-DEFAULT_MODEL_DIR = (
-    _environment_path(
-        "DIGIKAM_VIDEO_TAGGER_MODEL_DIR",
-        LOCAL_APP_DATA / "digikam" / "facesengine",
-    )
+DEFAULT_MODEL_DIR = _environment_path(
+    "DIGIKAM_VIDEO_TAGGER_MODEL_DIR",
+    LOCAL_APP_DATA / "digikam" / "facesengine",
 )
 DEFAULT_DB_HOST = os.environ.get("DIGIKAM_VIDEO_TAGGER_DB_HOST", "127.0.0.1")
 DEFAULT_DB_PORT = _environment_int("DIGIKAM_VIDEO_TAGGER_DB_PORT", 3307)
@@ -89,6 +85,7 @@ def read_kconfig_boolean(path: Path, section: str, key: str) -> bool | None:
             return False
         return None
     return None
+
 
 VIDEO_EXTENSIONS = frozenset(
     {

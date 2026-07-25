@@ -17,9 +17,9 @@ from .config import (
     DEFAULT_DB_PASSWORD,
     DEFAULT_DB_PORT,
     DEFAULT_DB_USER,
+    DEFAULT_DIGIKAM_CONFIG,
     DEFAULT_EXIFTOOL,
     DEFAULT_FFMPEG_DIR,
-    DEFAULT_DIGIKAM_CONFIG,
     DEFAULT_MODEL_DIR,
     DEFAULT_STAGING_DIR,
     VIDEO_EXTENSIONS,
@@ -29,10 +29,6 @@ from .config import (
 )
 from .digikam_db import DigiKamCatalog, DigiKamFaceGallery
 from .ffmpeg import FFmpegSampler
-from .metadata import ExifToolSidecarWriter
-from .models import FaceTagger, YoloObjectTagger, select_opencv_target
-from .pipeline import AnalysisResult, VideoTaggingPipeline
-from .process import run_command
 from .jobs import (
     MANIFEST_NAME,
     completed_video_for_source,
@@ -42,6 +38,10 @@ from .jobs import (
     mark_job_completed,
     prepare_job,
 )
+from .metadata import ExifToolSidecarWriter
+from .models import FaceTagger, YoloObjectTagger, select_opencv_target
+from .pipeline import AnalysisResult, VideoTaggingPipeline
+from .process import run_command
 
 
 def _path(value: str) -> Path:
@@ -53,7 +53,17 @@ def _tool_paths(args: argparse.Namespace) -> ToolPaths:
 
 
 def _database_config(args: argparse.Namespace) -> DatabaseConfig:
-    return DatabaseConfig(args.db_host, args.db_port, args.db_user, args.db_password, args.db_name)
+    return DatabaseConfig(
+        args.db_host, args.db_port, args.db_user, args.db_password, args.db_name
+    )
+
+
+def _require_cuda(args: argparse.Namespace) -> bool:
+    return args.ffmpeg_cuda and not args.allow_cpu_fallback
+
+
+def _require_opencl(args: argparse.Namespace) -> bool:
+    return args.opencl and not args.allow_cpu_fallback
 
 
 def _add_shared_options(parser: argparse.ArgumentParser) -> None:
@@ -68,7 +78,19 @@ def _add_shared_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--allow-cpu-fallback",
         action="store_true",
-        help="Allow CPU frame decoding or DNN inference when a GPU backend is unavailable",
+        help="Deprecated alias that permits CPU fallback for both FFmpeg and OpenCV",
+    )
+    parser.add_argument(
+        "--ffmpeg-cuda",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require CUDA frame decoding (default: enabled; use --no-ffmpeg-cuda for CPU)",
+    )
+    parser.add_argument(
+        "--opencl",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require OpenCL DNN inference (default: enabled; use --no-opencl for CPU)",
     )
 
 
@@ -107,38 +129,55 @@ def doctor(args: argparse.Namespace) -> int:
     paths = _tool_paths(args)
     checks: list[tuple[str, bool, str]] = []
     warnings: list[tuple[str, str]] = []
+    object_model = paths.yolo_xlarge if args.object_model == "xl" else paths.yolo_nano
     for name, path in (
         ("ffmpeg", paths.ffmpeg),
         ("ffprobe", paths.ffprobe),
         ("ExifTool", paths.exiftool),
         ("YuNet", paths.yunet),
         ("SFace", paths.sface),
-        ("YOLOv11 nano", paths.yolo_nano),
+        (f"YOLOv11 {args.object_model}", object_model),
         ("COCO names", paths.coco_names),
     ):
         checks.append((name, path.is_file(), str(path)))
 
-    sampler = FFmpegSampler(paths.ffmpeg, paths.ffprobe, require_cuda=not args.allow_cpu_fallback)
+    sampler = FFmpegSampler(
+        paths.ffmpeg, paths.ffprobe, require_cuda=_require_cuda(args)
+    )
     try:
-        version_output = run_command([paths.ffmpeg, "-hide_banner", "-version"], timeout=15).stdout
+        version_output = run_command(
+            [paths.ffmpeg, "-hide_banner", "-version"], timeout=15
+        ).stdout
         version = version_output.splitlines()[0]
-        hwaccels = run_command([paths.ffmpeg, "-hide_banner", "-hwaccels"], timeout=15).stdout.casefold()
-        checks.append(("FFmpeg build", "--enable-gpl" in version_output.casefold(), version))
-        checks.append(("FFmpeg CUDA", "cuda" in hwaccels, "CUDA is listed by -hwaccels"))
+        hwaccels = run_command(
+            [paths.ffmpeg, "-hide_banner", "-hwaccels"], timeout=15
+        ).stdout.casefold()
+        checks.append(
+            ("FFmpeg build", "--enable-gpl" in version_output.casefold(), version)
+        )
+        checks.append(
+            ("FFmpeg CUDA", "cuda" in hwaccels, "CUDA is listed by -hwaccels")
+        )
         sampler.cuda_smoke_test()
-        checks.append(("CUDA device", True, "CUDA device 0 initialized and processed a frame"))
+        checks.append(
+            ("CUDA device", True, "CUDA device 0 initialized and processed a frame")
+        )
     except Exception as error:
         checks.append(("CUDA device", False, str(error)))
 
     try:
-        target = select_opencv_target(require_opencl=not args.allow_cpu_fallback)
-        checks.append(("OpenCV DNN", True, f"OpenCV {cv2.__version__}, target={target.name}"))
+        target = select_opencv_target(require_opencl=_require_opencl(args))
+        checks.append(
+            ("OpenCV DNN", True, f"OpenCV {cv2.__version__}, target={target.name}")
+        )
         face_tagger = FaceTagger(paths.yunet, paths.sface, target, [])
-        object_tagger = YoloObjectTagger(paths.yolo_nano, paths.coco_names, target)
+        object_tagger = YoloObjectTagger(object_model, paths.coco_names, target)
         test_image = np.zeros((640, 640, 3), dtype=np.uint8)
         face_tagger.detect(test_image)
         object_tagger.detect(test_image)
-        checks.append(("digiKam models", True, "YuNet, SFace, and YOLOv11 inference completed"))
+        checks.append(
+            ("digiKam models", True, "YuNet, SFace, and YOLOv11 inference completed")
+        )
     except Exception as error:
         checks.append(("digiKam models", False, str(error)))
 
@@ -151,7 +190,7 @@ def doctor(args: argparse.Namespace) -> int:
     sidecar_reading = read_kconfig_boolean(
         DEFAULT_DIGIKAM_CONFIG,
         "Metadata Settings",
-        "Use XMP Sidecar For Reading",
+        "UseXMPSidecar4Reading",
     )
     checks.append(
         (
@@ -163,7 +202,9 @@ def doctor(args: argparse.Namespace) -> int:
     )
 
     try:
-        regions, person_tags, embeddings = DigiKamCatalog(_database_config(args)).face_statistics()
+        regions, person_tags, embeddings = DigiKamCatalog(
+            _database_config(args)
+        ).face_statistics()
         detail = (
             f"read-only connection succeeded; {regions} confirmed regions, "
             f"{person_tags} person tags, {embeddings} SFace embeddings"
@@ -199,7 +240,9 @@ def prepare(args: argparse.Namespace) -> int:
         print("No supported video files found.", file=sys.stderr)
         return 2
 
-    sampler = FFmpegSampler(paths.ffmpeg, paths.ffprobe, require_cuda=not args.allow_cpu_fallback)
+    sampler = FFmpegSampler(
+        paths.ffmpeg, paths.ffprobe, require_cuda=_require_cuda(args)
+    )
     total = len(videos)
     prepared = 0
     existing = 0
@@ -309,7 +352,9 @@ def prepare(args: argparse.Namespace) -> int:
     if not args.json and not failures and (prepared or existing):
         print("\nNext in digiKam:")
         print(f"  1. Scan the collection so {args.staging_dir} appears as an album.")
-        print("  2. Run normal face detection/recognition on that album and all sub-albums.")
+        print(
+            "  2. Run normal face detection/recognition on that album and all sub-albums."
+        )
         print("  3. Confirm or assign the person names and click Apply.")
         print("  4. Run this tool's finalize command for the same video(s).")
     return 1 if failures else 0
@@ -341,6 +386,7 @@ def finalize(args: argparse.Namespace) -> int:
                 "completed": completed_count,
                 "pending": 0,
                 "pending_unscanned": 0,
+                "pending_uncatalogued": 0,
                 "pending_unnamed": 0,
                 "failed": 0,
             }
@@ -364,6 +410,7 @@ def finalize(args: argparse.Namespace) -> int:
     applied = 0
     completed_without_people = 0
     pending_unscanned = 0
+    pending_uncatalogued = 0
     pending_unnamed = 0
     if not args.json:
         print(f"Found {total} proxy job(s) in the batch.")
@@ -371,13 +418,22 @@ def finalize(args: argparse.Namespace) -> int:
     for index, job in enumerate(jobs, start=1):
         try:
             if not job.source_is_unchanged():
-                raise RuntimeError("Source video is missing or changed since proxy extraction")
+                raise RuntimeError(
+                    "Source video is missing or changed since proxy extraction"
+                )
             missing_files = [frame for frame in job.frame_paths if not frame.is_file()]
             if missing_files:
-                raise RuntimeError(f"Proxy job is missing {len(missing_files)} generated frame(s)")
+                raise RuntimeError(
+                    f"Proxy job is missing {len(missing_files)} generated frame(s)"
+                )
 
             frame_faces = catalog.confirmed_faces_for_frames(job.frame_paths)
             not_scanned = [item.frame for item in frame_faces if item.image_id is None]
+            not_catalogued = [
+                item.frame
+                for item in frame_faces
+                if not getattr(item, "catalogued", True)
+            ]
             people = sorted(
                 {tag for item in frame_faces for tag in item.person_tag_paths},
                 key=str.casefold,
@@ -396,12 +452,26 @@ def finalize(args: argparse.Namespace) -> int:
             }
 
             if not_scanned:
-                pending_unscanned += 1
+                if not_catalogued:
+                    pending_uncatalogued += 1
+                else:
+                    pending_unscanned += 1
                 if args.json:
                     print(json.dumps(payload, ensure_ascii=False))
                 elif not args.summary_only:
-                    print(f"[{index}/{total} PENDING] {job.source_path}")
-                    print(f"  {len(not_scanned)} of {len(job.frames)} proxy frames are not in digiKam yet")
+                    if not_catalogued:
+                        print(
+                            f"[{index}/{total} STAGING-NOT-CATALOGUED] {job.source_path}"
+                        )
+                        print(
+                            "  staging directory is not under any digiKam Album Root; add it as a "
+                            "collection root and rescan"
+                        )
+                    else:
+                        print(f"[{index}/{total} PENDING] {job.source_path}")
+                        print(
+                            f"  {len(not_scanned)} of {len(job.frames)} proxy frames are not in digiKam yet"
+                        )
                 continue
             if not people:
                 if args.apply and getattr(args, "complete_without_people", False):
@@ -413,9 +483,13 @@ def finalize(args: argparse.Namespace) -> int:
                     if args.json:
                         print(json.dumps(payload, ensure_ascii=False))
                     elif not args.summary_only:
-                        print(f"[{index}/{total} COMPLETED-NO-PEOPLE] {job.source_path}")
+                        print(
+                            f"[{index}/{total} COMPLETED-NO-PEOPLE] {job.source_path}"
+                        )
                         if not args.keep_frames:
-                            print("  generated proxy frames deleted; no video sidecar was needed")
+                            print(
+                                "  generated proxy frames deleted; no video sidecar was needed"
+                            )
                 else:
                     pending_unnamed += 1
                     if args.json:
@@ -449,12 +523,16 @@ def finalize(args: argparse.Namespace) -> int:
                 if args.apply:
                     print(f"  sidecar={payload['sidecar']}")
                     if not args.keep_frames:
-                        print("  generated proxy frames deleted; rescan the staging album in digiKam")
+                        print(
+                            "  generated proxy frames deleted; rescan the staging album in digiKam"
+                        )
         except Exception as error:
             failures += 1
-            print(f"[{index}/{total} ERROR] {job.source_path}: {error}", file=sys.stderr)
+            print(
+                f"[{index}/{total} ERROR] {job.source_path}: {error}", file=sys.stderr
+            )
 
-    pending = pending_unscanned + pending_unnamed
+    pending = pending_unscanned + pending_uncatalogued + pending_unnamed
     completed_count = _completed_count(args.staging_dir, selected_sources)
     summary = {
         "type": "summary",
@@ -466,6 +544,7 @@ def finalize(args: argparse.Namespace) -> int:
         "completed": completed_count,
         "pending": pending,
         "pending_unscanned": pending_unscanned,
+        "pending_uncatalogued": pending_uncatalogued,
         "pending_unnamed": pending_unnamed,
         "failed": failures,
     }
@@ -477,11 +556,14 @@ def finalize(args: argparse.Namespace) -> int:
             if completed_without_people:
                 prefix += f", {completed_without_people} completed without people"
         else:
-            prefix = f"{total} active job(s), {completed_count} completed, {ready} ready"
+            prefix = (
+                f"{total} active job(s), {completed_count} completed, {ready} ready"
+            )
         print(
             "\nBatch summary: "
             f"{prefix}, {pending} pending "
-            f"({pending_unscanned} unscanned, {pending_unnamed} without confirmed people), "
+            f"({pending_unscanned} unscanned, {pending_uncatalogued} outside collection roots, "
+            f"{pending_unnamed} without confirmed people), "
             f"{failures} failed."
         )
 
@@ -512,11 +594,15 @@ def tag(args: argparse.Namespace) -> int:
         print("No supported video files found.", file=sys.stderr)
         return 2
 
-    target = select_opencv_target(require_opencl=not args.allow_cpu_fallback)
-    gallery = [] if args.no_people else DigiKamFaceGallery(_database_config(args)).load()
+    target = select_opencv_target(require_opencl=_require_opencl(args))
+    gallery = (
+        [] if args.no_people else DigiKamFaceGallery(_database_config(args)).load()
+    )
     object_tagger = None
     if not args.no_objects:
-        object_model = paths.yolo_xlarge if args.object_model == "xl" else paths.yolo_nano
+        object_model = (
+            paths.yolo_xlarge if args.object_model == "xl" else paths.yolo_nano
+        )
         object_tagger = YoloObjectTagger(
             object_model,
             paths.coco_names,
@@ -535,7 +621,7 @@ def tag(args: argparse.Namespace) -> int:
         )
 
     pipeline = VideoTaggingPipeline(
-        FFmpegSampler(paths.ffmpeg, paths.ffprobe, require_cuda=not args.allow_cpu_fallback),
+        FFmpegSampler(paths.ffmpeg, paths.ffprobe, require_cuda=_require_cuda(args)),
         object_tagger,
         face_tagger,
         ExifToolSidecarWriter(paths.exiftool),
@@ -559,7 +645,9 @@ def tag(args: argparse.Namespace) -> int:
             else:
                 mode = "APPLIED" if args.apply else "DRY-RUN"
                 print(f"[{mode}] {video}")
-                print(f"  frames={result.frame_count}, face_frames={result.face_frames}, codec={result.info.codec}")
+                print(
+                    f"  frames={result.frame_count}, face_frames={result.face_frames}, codec={result.info.codec}"
+                )
                 print(f"  tags={', '.join(result.tags) if result.tags else '(none)'}")
                 if result.metadata:
                     print(f"  sidecar={result.metadata.sidecar}")
@@ -574,8 +662,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    doctor_parser = subparsers.add_parser("doctor", help="Verify every runtime prerequisite")
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Verify every runtime prerequisite"
+    )
     _add_shared_options(doctor_parser)
+    doctor_parser.add_argument("--object-model", choices=("nano", "xl"), default="nano")
     doctor_parser.set_defaults(handler=doctor)
 
     prepare_parser = subparsers.add_parser(
@@ -589,7 +680,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=_path,
         help="Video file(s) or directory tree(s); directories recurse by default",
     )
-    prepare_parser.add_argument("--staging-dir", type=_path, default=DEFAULT_STAGING_DIR)
+    prepare_parser.add_argument(
+        "--staging-dir", type=_path, default=DEFAULT_STAGING_DIR
+    )
     prepare_parser.add_argument(
         "--recursive",
         action=argparse.BooleanOptionalAction,
@@ -623,14 +716,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=_path,
         help="Optional source file(s) or directory tree(s); omit to process all jobs",
     )
-    finalize_parser.add_argument("--staging-dir", type=_path, default=DEFAULT_STAGING_DIR)
+    finalize_parser.add_argument(
+        "--staging-dir", type=_path, default=DEFAULT_STAGING_DIR
+    )
     finalize_parser.add_argument(
         "--recursive",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Recurse through every supplied directory (default: enabled)",
     )
-    finalize_parser.add_argument("--apply", action="store_true", help="Write video XMP sidecars")
+    finalize_parser.add_argument(
+        "--apply", action="store_true", help="Write video XMP sidecars"
+    )
     finalize_parser.add_argument(
         "--complete-without-people",
         action="store_true",
@@ -686,9 +783,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_shared_options(tag_parser)
     tag_parser.add_argument("paths", nargs="+", type=_path)
-    tag_parser.add_argument("--apply", action="store_true", help="Write merge-only XMP sidecars")
-    tag_parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
-    tag_parser.add_argument("--json", action="store_true", help="Emit one JSON object per video")
+    tag_parser.add_argument(
+        "--apply", action="store_true", help="Write merge-only XMP sidecars"
+    )
+    tag_parser.add_argument(
+        "--recursive", action=argparse.BooleanOptionalAction, default=True
+    )
+    tag_parser.add_argument(
+        "--json", action="store_true", help="Emit one JSON object per video"
+    )
     tag_parser.add_argument("--sample-seconds", type=float, default=5.0)
     tag_parser.add_argument("--max-frames", type=int, default=120)
     tag_parser.add_argument("--max-dimension", type=int, default=1280)

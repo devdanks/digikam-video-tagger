@@ -48,7 +48,9 @@ def test_completion_ledger_matches_only_unchanged_source(tmp_path: Path) -> None
     assert completed_video_for_source(staging, video) is None
 
 
-def test_completion_ledger_supports_reviewed_video_without_people(tmp_path: Path) -> None:
+def test_completion_ledger_supports_reviewed_video_without_people(
+    tmp_path: Path,
+) -> None:
     staging = tmp_path / "staging"
     job_dir = staging / "job"
     job_dir.mkdir(parents=True)

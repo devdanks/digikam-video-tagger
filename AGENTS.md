@@ -5,12 +5,27 @@
 This is a Python 3.12 package using the `src` layout.
 
 - `src/digikam_video_tagger/`: application code.
-- `cli.py`: command definitions and batch orchestration.
-- `ffmpeg.py` and `pipeline.py`: GPU frame extraction and analysis flow.
-- `digikam_db.py`: read-only digiKam catalog access.
-- `metadata.py` and `jobs.py`: XMP sidecar writing, manifests, cleanup, and completion tracking.
+- `cli.py`: argparse command definitions and batch orchestration for all five subcommands
+  (`doctor`, `prepare`, `status`, `finalize`, `tag`).
+- `ffmpeg.py`: FFmpeg/FFprobe CUDA frame extraction with CPU fallback; `VideoInfo` probe.
+- `pipeline.py`: `VideoTaggingPipeline` — the `tag` command's analysis flow (YOLOv11 objects +
+  YuNet/SFace faces -> `EvidenceAccumulator` gating -> `Auto Tags/Video` sidecar tags).
+- `models.py`: `YoloObjectTagger` (YOLOv11 ONNX), `FaceTagger` (YuNet detect + SFace recognize),
+  and `select_opencv_target` (OpenCL/CPU DNN target selection).
+- `evidence.py`: `EvidenceAccumulator` and `TagEvidence` — per-label hit/frame-ratio gating used
+  by `pipeline.py`.
+- `digikam_db.py`: read-only digiKam catalog access. `DigiKamCatalog` reads confirmed face
+  assignments for `finalize`; `DigiKamFaceGallery` reads SFace training embeddings for the `tag`
+  recognizer.
+- `metadata.py`: `ExifToolSidecarWriter` — atomic XMP sidecar merge (`TagsList`,
+  `HierarchicalSubject`, `Subject`) via tempfile + `os.replace`.
+- `jobs.py`: proxy job manifests, completion ledger, manifest-owned cleanup, and rerun skipping.
+- `config.py`: environment-driven defaults, `ToolPaths`, `DatabaseConfig`, digiKamrc boolean reads.
+- `process.py`: `run_command` — argv-form subprocess wrapper with `CREATE_NO_WINDOW`.
+- `__init__.py`: OpenCL DNN kernel-cache setup and `__version__`.
 - `tests/`: pytest tests named `test_<module>.py`.
-- `README.md`: workstation setup and the two-pass People-tagging workflow.
+- `README.md`: workstation setup, the two-pass People-tagging workflow, and the direct `tag`
+  auto-tagging workflow.
 - `pyproject.toml` and `uv.lock`: package metadata and locked dependencies.
 
 Keep generated proxy frames, model data, and local databases outside the repository.

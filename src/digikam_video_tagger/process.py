@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 
 class CommandError(RuntimeError):
@@ -24,7 +24,9 @@ def run_command(
         errors="replace" if text else None,
         timeout=timeout,
         check=False,
-        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        creationflags=subprocess.CREATE_NO_WINDOW
+        if hasattr(subprocess, "CREATE_NO_WINDOW")
+        else 0,
     )
     if completed.returncode != 0:
         stderr = completed.stderr.strip() if isinstance(completed.stderr, str) else ""

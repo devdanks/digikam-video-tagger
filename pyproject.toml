@@ -35,11 +35,15 @@ digikam-video-tagger = "digikam_video_tagger.cli:main"
 [dependency-groups]
 dev = [
   "pytest>=8.3,<9",
+  "ruff>=0.12,<1",
 ]
 
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+ignore = ["BLE001", "ISC004"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/digikam_video_tagger"]

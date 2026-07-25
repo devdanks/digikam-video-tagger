@@ -1,7 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-import digikam_video_tagger.cli as cli
+from digikam_video_tagger import cli
 from digikam_video_tagger.cli import _discover_videos, build_parser
 
 
@@ -34,6 +34,15 @@ def test_folder_commands_are_recursive_by_default(tmp_path: Path) -> None:
     assert status_args.apply is False
 
 
+def test_backend_flags_can_be_controlled_independently(tmp_path: Path) -> None:
+    args = build_parser().parse_args(
+        ["prepare", str(tmp_path), "--no-ffmpeg-cuda", "--opencl"]
+    )
+
+    assert args.ffmpeg_cuda is False
+    assert args.opencl is True
+
+
 def test_status_is_successful_when_no_active_jobs(tmp_path: Path, capsys) -> None:
     args = build_parser().parse_args(["status", "--staging-dir", str(tmp_path)])
 
@@ -60,7 +69,9 @@ def test_finalize_partial_batch_is_successful_when_remaining_job_is_pending(
     monkeypatch.setattr(cli, "discover_jobs", lambda staging, sources: [job])
     monkeypatch.setattr(cli, "DigiKamCatalog", lambda config: catalog)
 
-    args = build_parser().parse_args(["finalize", "--staging-dir", str(tmp_path), "--apply"])
+    args = build_parser().parse_args(
+        ["finalize", "--staging-dir", str(tmp_path), "--apply"]
+    )
 
     assert args.handler(args) == 0
     output = capsys.readouterr().out
@@ -92,7 +103,9 @@ def test_finalize_can_complete_reviewed_job_without_people(
     monkeypatch.setattr(
         cli,
         "mark_job_completed",
-        lambda completed_job, people, sidecar: recorded.append((completed_job, people, sidecar)),
+        lambda completed_job, people, sidecar: recorded.append(
+            (completed_job, people, sidecar)
+        ),
     )
     monkeypatch.setattr(cli, "_completed_count", lambda staging, sources: 1)
 

@@ -20,18 +20,24 @@ def select_opencv_target(require_opencl: bool = True) -> OpenCVTarget:
     have_opencl = bool(cv2.ocl.haveOpenCL())
     if have_opencl:
         cv2.ocl.setUseOpenCL(True)
-        return OpenCVTarget(cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_OPENCL, "OpenCL")
+        return OpenCVTarget(
+            cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_OPENCL, "OpenCL"
+        )
     if require_opencl:
         raise RuntimeError("The Python OpenCV runtime cannot access OpenCL")
     return OpenCVTarget(cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU, "CPU")
 
 
-def _letterbox(image: np.ndarray, size: int = 640) -> tuple[np.ndarray, float, int, int]:
+def _letterbox(
+    image: np.ndarray, size: int = 640
+) -> tuple[np.ndarray, float, int, int]:
     height, width = image.shape[:2]
     scale = min(size / width, size / height)
     resized_width = max(1, round(width * scale))
     resized_height = max(1, round(height * scale))
-    resized = cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+    resized = cv2.resize(
+        image, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR
+    )
     left = (size - resized_width) // 2
     top = (size - resized_height) // 2
     canvas = np.full((size, size, 3), 114, dtype=np.uint8)
@@ -50,7 +56,9 @@ class YoloObjectTagger:
         nms_threshold: float = 0.45,
     ) -> None:
         self.class_names = [
-            line.strip() for line in class_names_path.read_text(encoding="utf-8").splitlines() if line.strip()
+            line.strip()
+            for line in class_names_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
         ]
         self.net = cv2.dnn.readNetFromONNX(str(model_path))
         self.net.setPreferableBackend(target.backend)
@@ -60,7 +68,9 @@ class YoloObjectTagger:
 
     def detect(self, image: np.ndarray) -> dict[str, float]:
         padded, scale, left, top = _letterbox(image, 640)
-        blob = cv2.dnn.blobFromImage(padded, 1.0 / 255.0, (640, 640), swapRB=True, crop=False)
+        blob = cv2.dnn.blobFromImage(
+            padded, 1.0 / 255.0, (640, 640), swapRB=True, crop=False
+        )
         self.net.setInput(blob)
         prediction = np.squeeze(self.net.forward())
         if prediction.ndim != 2:
@@ -85,7 +95,9 @@ class YoloObjectTagger:
             center_x, center_y, width, height = row[:4]
             x = int((center_x - width / 2 - left) / scale)
             y = int((center_y - height / 2 - top) / scale)
-            boxes.append([x, y, max(1, int(width / scale)), max(1, int(height / scale))])
+            boxes.append(
+                [x, y, max(1, int(width / scale)), max(1, int(height / scale))]
+            )
 
         kept = cv2.dnn.NMSBoxes(
             boxes,
@@ -98,7 +110,9 @@ class YoloObjectTagger:
             class_id = int(selected_ids[index])
             if 0 <= class_id < len(self.class_names):
                 name = self.class_names[class_id]
-                output[name] = max(output.get(name, 0.0), float(selected_confidences[index]))
+                output[name] = max(
+                    output.get(name, 0.0), float(selected_confidences[index])
+                )
         return output
 
 
@@ -152,7 +166,11 @@ class FaceTagger:
             for sample in self.gallery:
                 distance = 1.0 - float(np.dot(feature, sample.vector))
                 l2_distance = float(np.linalg.norm(feature - sample.vector))
-                if distance < self.recognition_distance and l2_distance < 1.05 and distance < best_distance:
+                if (
+                    distance < self.recognition_distance
+                    and l2_distance < 1.05
+                    and distance < best_distance
+                ):
                     best = sample
                     best_distance = distance
             if best is not None:

@@ -39,7 +39,10 @@ class EvidenceAccumulator:
         values = [
             TagEvidence(label, hits, self.frames, self._max_confidence[label])
             for label, hits in self._hits.items()
-            if hits >= required_hits and (hits / self.frames if self.frames else 0.0) >= min_frame_ratio
+            if hits >= required_hits
+            and (hits / self.frames if self.frames else 0.0) >= min_frame_ratio
         ]
-        values.sort(key=lambda item: (-item.hits, -item.max_confidence, item.label.casefold()))
+        values.sort(
+            key=lambda item: (-item.hits, -item.max_confidence, item.label.casefold())
+        )
         return values if limit is None else values[:limit]

@@ -12,7 +12,6 @@ from pathlib import Path
 
 from .ffmpeg import FFmpegSampler, VideoInfo
 
-
 MANIFEST_NAME = ".digikam-video-face-job.json"
 MANIFEST_VERSION = 1
 COMPLETED_NAME = ".digikam-video-face-completed.json"
@@ -56,7 +55,10 @@ class VideoFaceJob:
             stat = self.source_path.stat()
         except OSError:
             return False
-        return stat.st_size == self.source_size and stat.st_mtime_ns == self.source_mtime_ns
+        return (
+            stat.st_size == self.source_size
+            and stat.st_mtime_ns == self.source_mtime_ns
+        )
 
     def remove_generated_files(self) -> list[Path]:
         """Remove only files named by this manifest and their sidecars."""
@@ -65,7 +67,9 @@ class VideoFaceJob:
         for frame_path in self.frame_paths:
             resolved = frame_path.resolve()
             if resolved.parent != job_root:
-                raise RuntimeError(f"Unsafe proxy path outside job directory: {resolved}")
+                raise RuntimeError(
+                    f"Unsafe proxy path outside job directory: {resolved}"
+                )
             for generated in (resolved, Path(f"{resolved}.xmp")):
                 if generated.exists():
                     generated.unlink()
@@ -81,7 +85,7 @@ class VideoFaceJob:
         return removed
 
     @classmethod
-    def load(cls, manifest_path: Path) -> "VideoFaceJob":
+    def load(cls, manifest_path: Path) -> VideoFaceJob:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         if payload.get("schema_version") != MANIFEST_VERSION:
             raise ValueError(f"Unsupported proxy manifest version in {manifest_path}")
@@ -115,7 +119,10 @@ class CompletedVideo:
             stat = self.source_path.stat()
         except OSError:
             return False
-        return stat.st_size == self.source_size and stat.st_mtime_ns == self.source_mtime_ns
+        return (
+            stat.st_size == self.source_size
+            and stat.st_mtime_ns == self.source_mtime_ns
+        )
 
 
 def job_id_for_video(video: Path) -> str:
@@ -148,7 +155,11 @@ def load_completed_videos(staging_dir: Path) -> dict[str, CompletedVideo]:
 def completed_video_for_source(staging_dir: Path, video: Path) -> CompletedVideo | None:
     video = video.resolve()
     entry = load_completed_videos(staging_dir).get(job_id_for_video(video))
-    if entry is None or entry.source_path.resolve() != video or not entry.source_is_unchanged():
+    if (
+        entry is None
+        or entry.source_path.resolve() != video
+        or not entry.source_is_unchanged()
+    ):
         return None
     return entry
 
@@ -174,18 +185,20 @@ def mark_job_completed(
         "schema_version": COMPLETED_VERSION,
         "videos": {
             job_id: {
-                key: value
-                for key, value in asdict(item).items()
-                if key != "job_id"
+                key: value for key, value in asdict(item).items() if key != "job_id"
             }
             for job_id, item in sorted(existing.items())
         },
     }
-    descriptor, temp_name = tempfile.mkstemp(prefix=".completed-", suffix=".json", dir=staging_dir)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=".completed-", suffix=".json", dir=staging_dir
+    )
     os.close(descriptor)
     temp_ledger = Path(temp_name)
     try:
-        temp_ledger.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        temp_ledger.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
         os.replace(temp_ledger, ledger)
     finally:
         temp_ledger.unlink(missing_ok=True)
@@ -218,12 +231,16 @@ def prepare_job(
             )
         missing = [path for path in existing.frame_paths if not path.is_file()]
         if missing:
-            raise RuntimeError(f"Proxy job is incomplete; missing {len(missing)} frame(s): {job_dir}")
+            raise RuntimeError(
+                f"Proxy job is incomplete; missing {len(missing)} frame(s): {job_dir}"
+            )
         info = sampler.probe(video)
         return PreparedJob(existing, False, info)
 
     if job_dir.exists() and any(job_dir.iterdir()):
-        raise RuntimeError(f"Refusing to use non-empty directory without a valid manifest: {job_dir}")
+        raise RuntimeError(
+            f"Refusing to use non-empty directory without a valid manifest: {job_dir}"
+        )
     job_dir.mkdir(parents=True, exist_ok=True)
 
     generated: list[Path] = []
@@ -261,11 +278,15 @@ def prepare_job(
         )
         payload = asdict(job)
         payload.pop("job_dir")
-        descriptor, temp_name = tempfile.mkstemp(prefix=".manifest-", suffix=".json", dir=job_dir)
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=".manifest-", suffix=".json", dir=job_dir
+        )
         os.close(descriptor)
         temp_manifest = Path(temp_name)
         try:
-            temp_manifest.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            temp_manifest.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
             os.replace(temp_manifest, manifest_path)
         finally:
             temp_manifest.unlink(missing_ok=True)
@@ -283,7 +304,9 @@ def prepare_job(
             temp_dir.cleanup()
 
 
-def discover_jobs(staging_dir: Path, sources: set[Path] | None = None) -> list[VideoFaceJob]:
+def discover_jobs(
+    staging_dir: Path, sources: set[Path] | None = None
+) -> list[VideoFaceJob]:
     if not staging_dir.is_dir():
         return []
     wanted = {source.resolve() for source in sources} if sources else None

@@ -61,6 +61,8 @@ class FFmpegSampler:
             raise ValueError("sample_seconds must be greater than zero")
         if max_frames <= 0:
             raise ValueError("max_frames must be greater than zero")
+        if max_dimension <= 0:
+            raise ValueError("max_dimension must be greater than zero")
         if self.require_cuda:
             self.cuda_smoke_test()
         info = self.probe(video)
@@ -73,12 +75,19 @@ class FFmpegSampler:
                     "-hide_banner",
                     "-loglevel",
                     "error",
+                    *(
+                        ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+                        if self.require_cuda
+                        else []
+                    ),
                     "-i",
                     video,
                     "-map",
                     "0:v:0",
                     "-vf",
-                    self.sampling_filter(sample_seconds, max_dimension, cuda=False),
+                    self.sampling_filter(
+                        sample_seconds, max_dimension, cuda=self.require_cuda
+                    ),
                     "-frames:v",
                     str(max_frames),
                     "-fps_mode",
@@ -110,7 +119,7 @@ class FFmpegSampler:
             "force_divisible_by=2:reset_sar=1"
         )
         if cuda:
-            return f"hwupload,scale_cuda={scale},hwdownload,format=yuvj420p"
+            return f"{selection},hwupload,scale_cuda={scale},hwdownload,format=yuvj420p"
         return f"{selection},scale={scale}"
 
     def cuda_smoke_test(self) -> None:

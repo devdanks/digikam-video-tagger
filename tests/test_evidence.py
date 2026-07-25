@@ -1,3 +1,5 @@
+import pytest
+
 from digikam_video_tagger.evidence import EvidenceAccumulator
 
 
@@ -21,3 +23,12 @@ def test_single_frame_video_can_pass_min_hits() -> None:
     accepted = evidence.accepted(min_hits=2, min_frame_ratio=0.5)
 
     assert [item.label for item in accepted] == ["car"]
+
+
+def test_evidence_rejects_invalid_thresholds() -> None:
+    evidence = EvidenceAccumulator()
+
+    with pytest.raises(ValueError, match="min_frame_ratio"):
+        evidence.accepted(min_hits=1, min_frame_ratio=-0.1)
+    with pytest.raises(ValueError, match="limit"):
+        evidence.accepted(min_hits=1, min_frame_ratio=0.0, limit=-1)

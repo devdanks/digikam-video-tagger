@@ -90,6 +90,16 @@ class VideoFaceJob:
         if payload.get("schema_version") != MANIFEST_VERSION:
             raise ValueError(f"Unsupported proxy manifest version in {manifest_path}")
         frames = tuple(ProxyFrame(**frame) for frame in payload.pop("frames"))
+        job_root = manifest_path.parent.resolve()
+        for frame in frames:
+            frame_path = Path(frame.filename)
+            resolved = (job_root / frame_path).resolve()
+            if (
+                frame_path.is_absolute()
+                or len(frame_path.parts) != 1
+                or resolved.parent != job_root
+            ):
+                raise ValueError(f"Unsafe proxy frame filename: {frame.filename}")
         return cls(**payload, frames=frames, job_dir=manifest_path.parent)
 
 

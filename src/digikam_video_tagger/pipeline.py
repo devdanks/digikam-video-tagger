@@ -17,6 +17,7 @@ class AnalysisResult:
     video: Path
     info: VideoInfo
     frame_count: int
+    unreadable_frames: int
     face_frames: int
     objects: tuple[TagEvidence, ...]
     people: tuple[TagEvidence, ...]
@@ -64,10 +65,16 @@ class VideoTaggingPipeline:
         object_evidence = EvidenceAccumulator()
         person_evidence = EvidenceAccumulator()
         face_frames = 0
+        unreadable_frames = 0
         try:
             for frame_path in frames:
                 image = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
                 if image is None:
+                    unreadable_frames += 1
+                    if self.object_tagger is not None:
+                        object_evidence.add_frame({})
+                    if self.face_tagger is not None:
+                        person_evidence.add_frame({})
                     continue
                 if self.object_tagger is not None:
                     object_evidence.add_frame(self.object_tagger.detect(image))
@@ -100,6 +107,7 @@ class VideoTaggingPipeline:
             video=video,
             info=info,
             frame_count=len(frames),
+            unreadable_frames=unreadable_frames,
             face_frames=face_frames,
             objects=tuple(objects),
             people=tuple(people),

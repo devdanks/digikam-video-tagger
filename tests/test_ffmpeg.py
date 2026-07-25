@@ -16,9 +16,10 @@ def test_sampling_filter_always_selects_first_frame() -> None:
 def test_cuda_sampling_filter_keeps_cuda_operations_adjacent() -> None:
     value = FFmpegSampler.sampling_filter(5.0, 1920, cuda=True)
 
-    assert "select=" not in value
+    assert "select=" in value
     assert value.index("hwupload") < value.index("scale_cuda")
     assert value.index("scale_cuda") < value.index("hwdownload")
+    assert "isnan(prev_selected_t)" in value
 
 
 def test_cpu_sampling_filter_constrains_both_dimensions() -> None:

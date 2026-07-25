@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from digikam_video_tagger import digikam_db
+from digikam_video_tagger.config import DatabaseConfig
 from digikam_video_tagger.digikam_db import DigiKamCatalog
 
 
@@ -20,3 +22,17 @@ def test_tag_hierarchy_is_reconstructed() -> None:
     )
 
     assert paths[3] == "People/Family/Shelby"
+
+
+def test_catalog_connection_enforces_read_only_transactions(monkeypatch) -> None:
+    captured = {}
+
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(digikam_db.pymysql, "connect", fake_connect)
+
+    DigiKamCatalog(DatabaseConfig())._connect()
+
+    assert captured["init_command"] == "SET SESSION TRANSACTION READ ONLY"

@@ -149,19 +149,23 @@ def doctor(args: argparse.Namespace) -> int:
             [paths.ffmpeg, "-hide_banner", "-version"], timeout=15
         ).stdout
         version = version_output.splitlines()[0]
-        hwaccels = run_command(
-            [paths.ffmpeg, "-hide_banner", "-hwaccels"], timeout=15
-        ).stdout.casefold()
         checks.append(
             ("FFmpeg build", "--enable-gpl" in version_output.casefold(), version)
         )
-        checks.append(
-            ("FFmpeg CUDA", "cuda" in hwaccels, "CUDA is listed by -hwaccels")
-        )
-        sampler.cuda_smoke_test()
-        checks.append(
-            ("CUDA device", True, "CUDA device 0 initialized and processed a frame")
-        )
+        if _require_cuda(args):
+            hwaccels = run_command(
+                [paths.ffmpeg, "-hide_banner", "-hwaccels"], timeout=15
+            ).stdout.casefold()
+            checks.append(
+                ("FFmpeg CUDA", "cuda" in hwaccels, "CUDA is listed by -hwaccels")
+            )
+            sampler.cuda_smoke_test()
+            checks.append(
+                ("CUDA device", True, "CUDA device 0 initialized and processed a frame")
+            )
+        else:
+            checks.append(("FFmpeg CUDA", True, "not required"))
+            checks.append(("CUDA device", True, "not required"))
     except Exception as error:
         checks.append(("CUDA device", False, str(error)))
 
@@ -578,6 +582,7 @@ def _result_payload(result: AnalysisResult) -> dict:
         "duration_seconds": result.info.duration_seconds,
         "codec": result.info.codec,
         "frames": result.frame_count,
+        "unreadable_frames": result.unreadable_frames,
         "face_frames": result.face_frames,
         "objects": [asdict(item) for item in result.objects],
         "people": [asdict(item) for item in result.people],
@@ -646,7 +651,8 @@ def tag(args: argparse.Namespace) -> int:
                 mode = "APPLIED" if args.apply else "DRY-RUN"
                 print(f"[{mode}] {video}")
                 print(
-                    f"  frames={result.frame_count}, face_frames={result.face_frames}, codec={result.info.codec}"
+                    f"  frames={result.frame_count}, unreadable_frames={result.unreadable_frames}, "
+                    f"face_frames={result.face_frames}, codec={result.info.codec}"
                 )
                 print(f"  tags={', '.join(result.tags) if result.tags else '(none)'}")
                 if result.metadata:

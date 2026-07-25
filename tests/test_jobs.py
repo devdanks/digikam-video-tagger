@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+
+import pytest
 
 from digikam_video_tagger.jobs import (
     VideoFaceJob,
@@ -77,3 +80,29 @@ def test_completion_ledger_supports_reviewed_video_without_people(
     assert completed is not None
     assert completed.people == ()
     assert completed.sidecar is None
+
+
+def test_manifest_rejects_frame_path_outside_job_directory(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    manifest = job_dir / ".digikam-video-face-job.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "job_id": "job",
+                "source_video": str(tmp_path / "video.mp4"),
+                "source_size": 1,
+                "source_mtime_ns": 1,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "sample_seconds": 5.0,
+                "video_duration_seconds": 1.0,
+                "video_codec": "h264",
+                "frames": [{"filename": "../outside.jpg", "timestamp_seconds": 0.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unsafe proxy frame filename"):
+        VideoFaceJob.load(manifest)

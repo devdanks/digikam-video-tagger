@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .process import run_command
+from .tags import validate_tag_path
 
 
 @dataclass(frozen=True)
@@ -48,20 +49,26 @@ class ExifToolSidecarWriter:
         fields: dict[str, list[str]] = {}
         for field in ("TagsList", "HierarchicalSubject", "Subject"):
             value = payload[0].get(field, [])
-            fields[field] = (
-                [str(value)] if isinstance(value, str) else [str(tag) for tag in value]
-            )
+            if value is None:
+                fields[field] = []
+            elif isinstance(value, str):
+                fields[field] = [value]
+            elif isinstance(value, list):
+                fields[field] = [str(tag) for tag in value]
+            else:
+                raise ValueError(f"ExifTool returned an invalid {field} value")
         return fields
 
     def write_tags(self, video: Path, tags: list[str]) -> MetadataWriteResult:
         sidecar = self.sidecar_path(video)
+        normalized_tags = [validate_tag_path(tag) for tag in tags]
         existing_tags = self.read_digikam_tags(sidecar)
         embedded_tags = self.read_digikam_tags(video)
         existing_keys = {tag.casefold() for tag in [*existing_tags, *embedded_tags]}
         new_tags = sorted(
             {
                 tag.strip()
-                for tag in tags
+                for tag in normalized_tags
                 if tag.strip() and tag.strip().casefold() not in existing_keys
             },
             key=str.casefold,

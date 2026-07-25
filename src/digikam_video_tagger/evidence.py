@@ -35,6 +35,12 @@ class EvidenceAccumulator:
         min_frame_ratio: float,
         limit: int | None = None,
     ) -> list[TagEvidence]:
+        if min_hits < 1:
+            raise ValueError("min_hits must be at least 1")
+        if not 0.0 <= min_frame_ratio <= 1.0:
+            raise ValueError("min_frame_ratio must be between 0 and 1")
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be non-negative")
         required_hits = min(max(1, min_hits), self.frames)
         values = [
             TagEvidence(label, hits, self.frames, self._max_confidence[label])

@@ -44,8 +44,9 @@ recognized people add `People/<name>`.
 
 - Windows with Python 3.12 or newer
 - [uv](https://docs.astral.sh/uv/)
-- digiKam with XMP sidecar reading enabled (`UseXMPSidecar4Reading=true` in the `Metadata Settings`
-  group); this is needed for adjacent video sidecars to override embedded metadata
+- digiKam with XMP sidecar reading enabled (`Use XMP Sidecar For Reading=true` in the
+  `Metadata Settings` group); this is needed for adjacent video sidecars to override embedded
+  metadata
 - digiKam MariaDB reachable in read-only use for `finalize` and face-name recognition in `tag`
 - FFmpeg and FFprobe; CUDA is validated by default and can be disabled with `--no-ffmpeg-cuda`
 - OpenCV OpenCL is required by default for inference and can be disabled with `--no-opencl`

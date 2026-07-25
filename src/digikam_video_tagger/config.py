@@ -87,6 +87,15 @@ def read_kconfig_boolean(path: Path, section: str, key: str) -> bool | None:
     return None
 
 
+def digikam_sidecar_reading_enabled(path: Path) -> bool | None:
+    """Read digiKam's sidecar-reading option across supported config key names."""
+    for key in ("Use XMP Sidecar For Reading", "UseXMPSidecar4Reading"):
+        value = read_kconfig_boolean(path, "Metadata Settings", key)
+        if value is not None:
+            return value
+    return None
+
+
 VIDEO_EXTENSIONS = frozenset(
     {
         ".3g2",

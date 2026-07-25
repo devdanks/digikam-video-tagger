@@ -25,7 +25,7 @@ from .config import (
     VIDEO_EXTENSIONS,
     DatabaseConfig,
     ToolPaths,
-    read_kconfig_boolean,
+    digikam_sidecar_reading_enabled,
 )
 from .digikam_db import DigiKamCatalog, DigiKamFaceGallery
 from .ffmpeg import FFmpegSampler
@@ -191,11 +191,7 @@ def doctor(args: argparse.Namespace) -> int:
     except Exception as error:
         checks.append(("ExifTool runtime", False, str(error)))
 
-    sidecar_reading = read_kconfig_boolean(
-        DEFAULT_DIGIKAM_CONFIG,
-        "Metadata Settings",
-        "UseXMPSidecar4Reading",
-    )
+    sidecar_reading = digikam_sidecar_reading_enabled(DEFAULT_DIGIKAM_CONFIG)
     checks.append(
         (
             "digiKam sidecar reading",

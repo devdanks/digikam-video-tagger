@@ -34,7 +34,7 @@ digikam-video-tagger = "digikam_video_tagger.cli:main"
 
 [dependency-groups]
 dev = [
-  "pytest>=8.3,<9",
+  "pytest>=9.0.3,<10",
   "ruff>=0.12,<1",
 ]
 

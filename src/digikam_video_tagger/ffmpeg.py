@@ -76,7 +76,18 @@ class FFmpegSampler:
                     "-loglevel",
                     "error",
                     *(
-                        ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+                        [
+                            "-init_hw_device",
+                            "cuda=gpu:0",
+                            "-filter_hw_device",
+                            "gpu",
+                            "-hwaccel",
+                            "cuda",
+                            "-hwaccel_device",
+                            "gpu",
+                            "-hwaccel_output_format",
+                            "cuda",
+                        ]
                         if self.require_cuda
                         else []
                     ),
@@ -119,7 +130,10 @@ class FFmpegSampler:
             "force_divisible_by=2:reset_sar=1"
         )
         if cuda:
-            return f"{selection},hwupload,scale_cuda={scale},hwdownload,format=yuvj420p"
+            return (
+                f"{selection},hwupload,scale_cuda={scale},"
+                "hwdownload,format=nv12,format=yuvj420p"
+            )
         return f"{selection},scale={scale}"
 
     def cuda_smoke_test(self) -> None:

@@ -64,8 +64,9 @@ cd digikam-video-tagger
 uv sync
 ```
 
-FFmpeg is discovered from `PATH`. For the remaining local settings, copy and load the PowerShell
-configuration template:
+FFmpeg and ExifTool are discovered from `PATH`. For the remaining local settings, copy and load
+the PowerShell configuration template. Only uncomment their overrides when a tool is not on
+`PATH`:
 
 ```powershell
 Copy-Item config.example.ps1 config.local.ps1

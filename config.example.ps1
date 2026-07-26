@@ -4,6 +4,7 @@
 # FFmpeg and ExifTool are discovered from PATH by default. Uncomment only when needed:
 # $env:DIGIKAM_VIDEO_TAGGER_FFMPEG_DIR = 'C:\path\to\ffmpeg\bin'
 # $env:DIGIKAM_VIDEO_TAGGER_EXIFTOOL = 'C:\path\to\exiftool.exe'
+# Proxy staging is automatic: %LOCALAPPDATA%\digikam-video-tagger\staging.
 $env:DIGIKAM_VIDEO_TAGGER_MODEL_DIR = "$env:LOCALAPPDATA\digikam\facesengine"
 $env:DIGIKAM_VIDEO_TAGGER_DIGIKAM_CONFIG = "$env:LOCALAPPDATA\digikamrc"
 

@@ -1,173 +1,151 @@
 # digiKam Video Tagger
 
-People tagging for videos using digiKam's existing face-recognition workflow, with optional GPU
-backend validation for the supported workstation configuration.
+Tag video files through digiKam without modifying the video bytes or digiKam's database. All metadata is written atomically to adjacent XMP sidecars such as `video.mp4.xmp`.
 
-The tool ships two workflows that share an FFmpeg frame sampler and an ExifTool sidecar writer,
-and never write directly to digiKam's database or rewrite the video stream:
+## Choose a workflow
 
-- **Two-pass People workflow** (`prepare` / `status` / `finalize`): extracts temporary JPEG proxy
-  frames, lets digiKam's native face workflow detect and confirm People, then copies the confirmed
-  People hierarchy to adjacent video XMP sidecars and removes the proxies.
-- **Direct auto-tagging** (`tag`): runs YOLOv11 object detection and YuNet/SFace face recognition
-  on extracted frames, accumulates per-label evidence, and writes `Auto Tags/Video` sidecars in one
-  pass. It records object presence and face presence — it does **not** populate digiKam People
-  regions.
+| Goal | Command workflow |
+|---|---|
+| Copy **confirmed digiKam People** tags to videos | `prepare` → digiKam face review → `status` → `finalize --apply` |
+| Add automatic object/face-presence tags | `tag --apply` |
 
-> **Status:** Alpha. The supported workflow targets Windows and digiKam with MariaDB. CUDA and
-> OpenCL are required by default, but can be independently relaxed for CPU-capable workstations.
+The People workflow is the normal workflow. The automatic `tag` workflow does **not** create or confirm digiKam People regions.
 
-## How it works
+## One-time setup
 
-Two-pass People workflow:
-
-```text
-video tree -> sampled proxy frames -> digiKam face workflow -> video.ext.xmp -> proxy cleanup
-```
-
-Each video receives an isolated, manifest-backed proxy folder. Folder inputs recurse by default,
-completed videos are tracked, and reruns skip unchanged work. Sidecars preserve existing metadata
-while adding digiKam-compatible `TagsList`, `HierarchicalSubject`, and `Subject` values.
-
-Direct auto-tagging (`tag`) skips the manual digiKam face-review workflow:
-
-```text
-video -> sampled frames -> YOLOv11 objects + YuNet/SFace faces -> evidence gating -> video.ext.xmp
-```
-
-A label is written only when it is seen in at least `--min-object-hits` (or `--min-person-hits`)
-frames and in at least `--min-frame-ratio` of all sampled frames. Object tags land under
-`Auto Tags/Video/Objects/<label>`, any frame with a face adds `Auto Tags/Video/Contains Faces`, and
-recognized people add `People/<name>`.
-
-## Requirements
-
-- Windows with Python 3.12 or newer
-- [uv](https://docs.astral.sh/uv/)
-- digiKam with XMP sidecar reading enabled (`Use XMP Sidecar For Reading=true` in the
-  `Metadata Settings` group); this is needed for adjacent video sidecars to override embedded
-  metadata
-- digiKam MariaDB reachable in read-only use for `finalize` and face-name recognition in `tag`
-- FFmpeg and FFprobe; CUDA is validated by default and can be disabled with `--no-ffmpeg-cuda`
-- OpenCV OpenCL is required by default for inference and can be disabled with `--no-opencl`
-- ExifTool (the copy bundled with digiKam is suitable)
-- digiKam face models (YuNet `face_detection_yunet_2023mar.onnx`, SFace
-  `face_recognition_sface_2021dec.onnx`) and trained recognition data
-- YOLOv11 ONNX weights (`yolo11n.onnx`, or `yolo11x.onnx` for `tag --object-model xl`) plus
-  `coco.names` — required by `tag` and checked by `doctor`
-
-## Install
+### 1. Install and configure the project
 
 ```powershell
 git clone https://github.com/devdanks/digikam-video-tagger.git
 cd digikam-video-tagger
 uv sync
-```
-
-FFmpeg and ExifTool are discovered from `PATH`. For the remaining local settings, copy and load
-the PowerShell configuration template. Only uncomment their overrides when a tool is not on
-`PATH`:
-
-```powershell
 Copy-Item config.example.ps1 config.local.ps1
-# Edit config.local.ps1 for this workstation.
+# Edit config.local.ps1 only if your database, model, FFmpeg, or ExifTool settings differ.
 . .\config.local.ps1
 uv run digikam-video-tagger doctor
 ```
 
-`config.local.ps1` is ignored by Git. Every setting can also be supplied as a CLI option. Run
-`uv run digikam-video-tagger --help` and the relevant subcommand's `--help` for details.
+`config.local.ps1` is ignored by Git. **Dot-source it in every new PowerShell session** before running the tool, so its local backend and database settings are available.
 
-Proxy frames are stored automatically under
-`%LOCALAPPDATA%\digikam-video-tagger\staging`; no staging path needs to be configured. Add that
-directory as a digiKam Album Root once so digiKam can catalog the temporary frames.
+FFmpeg and ExifTool are found from `PATH` automatically. Do not add example placeholder paths unless the tools are not on `PATH`.
 
-Use `doctor --object-model xl` before selecting the XL object model to validate `yolo11x.onnx`.
-The legacy `--allow-cpu-fallback` permits CPU fallback for both backends; prefer the independent
-`--no-ffmpeg-cuda` and `--no-opencl` controls when only one backend needs to be relaxed.
+### 2. Configure digiKam once
 
-## Two-pass People workflow
+1. Enable **XMP sidecar reading** in digiKam's Metadata settings.
+2. Add this automatically managed directory as a digiKam **Album Root**:
 
-Prepare an entire video tree:
+   ```text
+   %LOCALAPPDATA%\digikam-video-tagger\staging
+   ```
 
-```powershell
-uv run digikam-video-tagger prepare "D:\Media\Videos"
-```
+The staging location is fixed by the application. **Do not configure or choose a staging path.** It must be an Album Root so digiKam can catalog the temporary JPEG proxy frames.
 
-In digiKam:
+## Confirmed People workflow
 
-1. Scan for new items under `%LOCALAPPDATA%\digikam-video-tagger\staging`.
-2. Detect and recognize faces on that album, including all subalbums.
-3. Confirm or assign People names and click **Apply**.
+Run these steps in order for every batch.
 
-If `status` reports `STAGING-NOT-CATALOGUED`, the managed staging directory is not registered as a
-digiKam Album Root; add it as a collection root and rescan before continuing.
-
-Inspect the batch without writing or deleting anything:
+### 1. Prepare proxy frames
 
 ```powershell
-uv run digikam-video-tagger status "D:\Media\Videos"
+. .\config.local.ps1
+uv run digikam-video-tagger prepare "G:\Videos"
 ```
 
-Finalize every fully catalogued video. This writes any confirmed People tags, records catalogued
-videos with no People tags as reviewed, and removes all generated proxy frames:
+The command creates temporary JPEG frames in the managed staging directory. It does not change the source videos or write People tags yet.
+
+### 2. Review faces in digiKam
+
+In digiKam, open the managed staging Album Root and:
+
+1. Scan for new items, including subalbums.
+2. Run face detection and recognition.
+3. Confirm or assign People names.
+4. Click **Apply** in digiKam.
+
+### 3. Check readiness — do not skip this step
 
 ```powershell
-uv run digikam-video-tagger finalize "D:\Media\Videos" --apply
+. .\config.local.ps1
+uv run digikam-video-tagger status "G:\Videos"
 ```
 
-`--apply` fails rather than deleting anything for a video whose proxy frames have not yet been
-catalogued. Reread metadata for the source-video album in digiKam afterward. Use
-`prepare --reprocess-completed` to deliberately scan completed videos again.
+Only continue when the summary reports **`0 pending`** and **`0 failed`**. A pending job means one or more proxy frames are not yet catalogued by digiKam. Add/rescan the managed staging Album Root, then run `status` again.
 
-## Direct auto-tagging (`tag`)
-
-Tag a video tree in a single pass without manual face review. Without `--apply` it is a dry run
-that prints the tags it would write:
+### 4. Finalize the complete batch
 
 ```powershell
-uv run digikam-video-tagger tag "D:\Media\Videos"
+. .\config.local.ps1
+uv run digikam-video-tagger finalize "G:\Videos" --apply
 ```
 
-Write the merged sidecars:
+`--apply` is a total-completion operation:
+
+- writes adjacent XMP sidecars for videos with confirmed People tags;
+- records fully catalogued videos with no confirmed People tags as reviewed;
+- removes all manifest-owned proxy frames and proxy job folders;
+- refuses to remove a video’s proxies if any of its frames are not catalogued.
+
+Afterward, reread metadata for the source-video album in digiKam.
+
+### 5. Verify the written sidecars with ExifTool
+
+Run this standard PowerShell command to inspect the People fields in every XMP sidecar under the
+video root:
 
 ```powershell
-uv run digikam-video-tagger tag "D:\Media\Videos" --apply
+# Uses the configured path when config.local.ps1 is loaded; otherwise uses PATH.
+$exiftool = if ($env:DIGIKAM_VIDEO_TAGGER_EXIFTOOL) {
+  $env:DIGIKAM_VIDEO_TAGGER_EXIFTOOL
+} else {
+  (Get-Command exiftool -ErrorAction Stop).Source
+}
+Get-ChildItem -LiteralPath 'G:\Videos' -Recurse -File -Filter '*.xmp' |
+  ForEach-Object {
+    & $exiftool -G1 -s -FileName `
+      -XMP-digiKam:TagsList `
+      -XMP-lr:HierarchicalSubject `
+      -XMP-dc:Subject `
+      $_.FullName
+  }
 ```
 
-Skip detection stages or tune the evidence threshold:
+For each person, the output should agree across all three fields. For example:
+
+```text
+[XMP-digiKam] TagsList            : People/Family/Shelby
+[XMP-lr]      HierarchicalSubject : People|Family|Shelby
+[XMP-dc]      Subject             : Shelby
+```
+
+## Automatic tags (`tag`)
+
+Use `tag` only when you want automatic object or face-presence tags rather than the reviewed People workflow:
 
 ```powershell
-uv run digikam-video-tagger tag "D:\Media\Videos" --apply --no-people --min-object-hits 3
+# Preview only — writes nothing.
+uv run digikam-video-tagger tag "G:\Videos"
+
+# Write Auto Tags/Video sidecars.
+uv run digikam-video-tagger tag "G:\Videos" --apply
 ```
 
-The `tag` command writes object-presence and face-presence tags. It does **not** create digiKam
-People regions — use the two-pass workflow above for confirmed People assignments. Face
-recognition reads digiKam's SFace training embeddings (`DigiKamFaceGallery`) and only emits
-`People/<name>` for faces matching the trained gallery within `--person-distance`; use
-`--no-people` to avoid the catalog lookup.
+`tag` uses YOLOv11 for objects and YuNet/SFace for faces. It writes object tags under `Auto Tags/Video/Objects/...`, adds `Auto Tags/Video/Contains Faces` when appropriate, and can add recognized `People/<name>` labels from the SFace gallery. It does not create digiKam face regions or replace manual face confirmation.
 
-## Safety
+## Safety guarantees
 
-- digiKam database connections are query-only.
-- Video bytes and timestamps are not modified.
-- Metadata is merged into `filename.ext.xmp` sidecars atomically.
-- Existing embedded and sidecar tags are deduplicated, and all three digiKam-compatible tag fields
-  (`TagsList`, `HierarchicalSubject`, and `Subject`) are verified before a sidecar is replaced.
-- `finalize --apply` removes only manifest-owned proxy files and their sidecars after a video is
-  recorded as complete.
-- Jobs stop if a source video changes after extraction.
+- digiKam database access is read-only.
+- Videos are never rewritten.
+- Metadata is merged into `video.ext.xmp` sidecars atomically.
+- Existing sidecar and embedded tags are preserved and deduplicated.
+- `finalize --apply` deletes only files listed in its validated proxy-job manifests.
+- A changed source video is not finalized from stale proxy frames.
 
 ## Development
 
 ```powershell
 uv run pytest
 uv run python -m compileall -q src tests
-uv run ruff check .
-uv run ruff format --check .
 uv build
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). digiKam's relevant documentation
-covers [metadata sidecars](https://docs.digikam.org/en/setup_application/metadata_settings.html) and
-[database behavior](https://docs.digikam.org/en/getting_started/database_intro.html).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). For digiKam configuration, see its documentation on [metadata sidecars](https://docs.digikam.org/en/setup_application/metadata_settings.html) and [database behavior](https://docs.digikam.org/en/getting_started/database_intro.html).

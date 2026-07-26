@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from digikam_video_tagger import cli
 from digikam_video_tagger.cli import _discover_videos, build_parser
 
@@ -26,10 +28,12 @@ def test_folder_commands_are_recursive_by_default(tmp_path: Path) -> None:
     prepare_args = parser.parse_args(["prepare", str(tmp_path)])
     finalize_args = parser.parse_args(["finalize", str(tmp_path)])
     status_args = parser.parse_args(["status", str(tmp_path)])
+    autofinalize_args = parser.parse_args(["autofinalize", str(tmp_path)])
 
     assert prepare_args.recursive is True
     assert finalize_args.recursive is True
     assert status_args.recursive is True
+    assert autofinalize_args.recursive is True
     assert status_args.summary_only is True
     assert status_args.apply is False
 
@@ -41,6 +45,87 @@ def test_backend_flags_can_be_controlled_independently(tmp_path: Path) -> None:
 
     assert args.ffmpeg_cuda is False
     assert args.opencl is True
+
+
+def test_autofinalize_requires_a_source_path() -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(["autofinalize"])
+    assert error.value.code == 2
+
+
+def test_autofinalize_handler_outputs_json_summary(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+
+    class FakeService:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def run(
+            self, videos: list[Path], *, apply: bool, reprocess_completed: bool
+        ) -> tuple[list[object], object]:
+            result = SimpleNamespace(
+                source_video=videos[0],
+                job_id="abc",
+                frame_count=1,
+                unreadable_frames=0,
+                face_frames=1,
+                known_people=("People/Mom",),
+                placeholder_people=(),
+                proposed_replacements=(),
+                completed=True,
+                applied=apply,
+                sidecar=None,
+                removed_proxy_files=0,
+                error=None,
+            )
+            summary = SimpleNamespace(
+                videos=1,
+                applied=1 if apply else 0,
+                completed=1,
+                known_people=1,
+                clustered_people=0,
+                resolved_people=0,
+                failed=0,
+            )
+            return [result], summary
+
+    class FakeClusterStore:
+        @classmethod
+        def empty(cls, **kwargs: object) -> object:
+            return SimpleNamespace(
+                unknown_root="People/Unknown",
+                store_id="store",
+                clusters={},
+                save=lambda path: None,
+            )
+
+        @classmethod
+        def load(cls, path: Path, **kwargs: object) -> object:
+            return cls.empty()
+
+    monkeypatch.setattr(cli, "AutoFinalizeService", FakeService)
+    monkeypatch.setattr(cli, "FaceClusterStore", FakeClusterStore)
+    monkeypatch.setattr(cli, "_model_fingerprint", lambda path: "x")
+    monkeypatch.setattr(cli, "select_opencv_target", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        cli, "DigiKamFaceGallery", lambda config: SimpleNamespace(load=list)
+    )
+    monkeypatch.setattr(cli, "FaceTagger", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(cli, "FFmpegSampler", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        cli, "ExifToolSidecarWriter", lambda *args, **kwargs: SimpleNamespace()
+    )
+
+    args = build_parser().parse_args(["autofinalize", str(tmp_path), "--json"])
+    assert args.handler(args) == 0
+    output = capsys.readouterr().out
+    assert '"type": "summary"' in output
+    assert '"command": "autofinalize"' in output
+    assert '"applied": 0' in output
 
 
 def test_status_is_successful_when_no_active_jobs(tmp_path: Path, capsys) -> None:

@@ -7,9 +7,10 @@ Tag video files through digiKam without modifying the video bytes or digiKam's d
 | Goal | Command workflow |
 |---|---|
 | Copy **confirmed digiKam People** tags to videos | `prepare` → digiKam face review → `status` → `finalize --apply` |
+| Recognize **known people** and cluster unknown faces automatically | `autofinalize` |
 | Add automatic object/face-presence tags | `tag --apply` |
 
-The People workflow is the normal workflow. The automatic `tag` workflow does **not** create or confirm digiKam People regions.
+The confirmed-People workflow is the normal workflow. The automatic `autofinalize` workflow recognizes people from the read-only SFace gallery, assigns stable `People/Unknown/Person_NNN` placeholders to accepted unknown faces, and resolves those placeholders later when a cluster centroid matches the gallery. The automatic `tag` workflow does **not** create or confirm digiKam People regions.
 
 ## One-time setup
 
@@ -38,7 +39,7 @@ FFmpeg and ExifTool are found from `PATH` automatically. Do not add example plac
    %LOCALAPPDATA%\digikam-video-tagger\staging
    ```
 
-The staging location is fixed by the application. **Do not configure or choose a staging path.** It must be an Album Root so digiKam can catalog the temporary JPEG proxy frames.
+The staging location is fixed by the application. **Do not configure or choose a staging path.** It must be an Album Root so digiKam can catalog the temporary JPEG proxy frames used by `prepare` and `finalize`. The `autofinalize` workflow writes sidecars directly and does not need the staging Album Root, but it still uses the staging directory for proxy frames, the cluster store, and the completion ledger.
 
 ## Confirmed People workflow
 
@@ -117,6 +118,32 @@ For each person, the output should agree across all three fields. For example:
 [XMP-dc]      Subject             : Shelby
 ```
 
+## Automated People workflow (`autofinalize`)
+
+`autofinalize` discovers videos, extracts proxy frames, recognizes people against the read-only
+SFace gallery, and clusters unknown faces into stable `People/Unknown/Person_NNN` placeholders. It
+writes adjacent XMP sidecars, records completion, and removes only the manifest-owned proxy frames.
+
+```powershell
+# Preview proposed tags without writing anything.
+uv run digikam-video-tagger autofinalize "G:\Videos"
+
+# Write sidecars, save accepted clusters, record completion, and clean proxies.
+uv run digikam-video-tagger autofinalize "G:\Videos" --apply
+```
+
+On later runs, if an unknown cluster's centroid becomes a strong match for a newly trained
+gallery identity, `autofinalize --apply` adds `People/<name>` to every unchanged source video that
+owns that placeholder and removes the exact `People/Unknown/Person_NNN` tag from the sidecar.
+Replacement only happens when the completion ledger proves the tool wrote the placeholder, so user
+and unrelated tags are never touched.
+
+Placeholder stability is best-effort, not biometric certainty. Before making `autofinalize` your
+default workflow, run a local calibration set (repeated people, similar relatives, profiles,
+occlusion, low light, motion blur, multiple people per frame, and false-positive detections) and
+choose a conservative `--cluster-distance` that favors splitting one person into two placeholders
+over merging two people into one.
+
 ## Automatic tags (`tag`)
 
 Use `tag` only when you want automatic object or face-presence tags rather than the reviewed People workflow:
@@ -139,6 +166,11 @@ uv run digikam-video-tagger tag "G:\Videos" --apply
 - Existing sidecar and embedded tags are preserved and deduplicated.
 - `finalize --apply` deletes only files listed in its validated proxy-job manifests.
 - A changed source video is not finalized from stale proxy frames.
+- `autofinalize --apply` deletes only manifest-owned proxy frames and only removes exact
+  `People/Unknown/Person_NNN` tags that the completion ledger proves the tool wrote.
+- `autofinalize` persists a cluster store (`.digikam-video-face-clusters.json`) keyed to the SFace
+  model fingerprint; a changed model requires an explicit rebuild and is never silently reused.
+- Only one `autofinalize --apply` operation may run against a staging directory at a time.
 
 ## Development
 

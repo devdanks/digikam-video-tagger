@@ -671,19 +671,23 @@ def autofinalize(args: argparse.Namespace) -> int:
 
     cluster_store_path = args.staging_dir / CLUSTER_STORE_NAME
     model_fingerprint = _model_fingerprint(paths.sface)
-    if cluster_store_path.is_file():
-        cluster_store = FaceClusterStore.load(
-            cluster_store_path,
-            model_fingerprint=model_fingerprint,
-            distance_threshold=args.cluster_distance,
-            unknown_root=args.unknown_root,
-        )
-    else:
-        cluster_store = FaceClusterStore.empty(
-            model_fingerprint=model_fingerprint,
-            distance_threshold=args.cluster_distance,
-            unknown_root=args.unknown_root,
-        )
+    try:
+        if cluster_store_path.is_file():
+            cluster_store = FaceClusterStore.load(
+                cluster_store_path,
+                model_fingerprint=model_fingerprint,
+                distance_threshold=args.cluster_distance,
+                unknown_root=args.unknown_root,
+            )
+        else:
+            cluster_store = FaceClusterStore.empty(
+                model_fingerprint=model_fingerprint,
+                distance_threshold=args.cluster_distance,
+                unknown_root=args.unknown_root,
+            )
+    except ValueError as error:
+        print(f"Cannot load face cluster store: {error}", file=sys.stderr)
+        return 2
 
     options = AutoFinalizeOptions(
         sample_seconds=args.sample_seconds,

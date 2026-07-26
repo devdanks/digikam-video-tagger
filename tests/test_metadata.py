@@ -92,3 +92,101 @@ def test_write_tags_rejects_reserved_hierarchy_characters(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match="'\\|'"):
         ExifToolSidecarWriter(Path("exiftool")).write_tags(video, ["People/A|lice"])
+
+
+def test_remove_tags_removes_only_requested_owned_values(
+    tmp_path: Path, monkeypatch
+) -> None:
+    video = tmp_path / "clip.mp4"
+    sidecar = Path(f"{video}.xmp")
+    video.write_bytes(b"video")
+    sidecar.write_text("original", encoding="utf-8")
+    writer = ExifToolSidecarWriter(Path("exiftool"))
+
+    monkeypatch.setattr(
+        writer,
+        "read_digikam_tags",
+        lambda item: ["People/Unknown/Person_001", "People/Mom"],
+    )
+
+    def fake_read_tag_fields(item: Path) -> dict[str, list[str]]:
+        # Simulate ExifTool output after removing the placeholder from the temp copy.
+        if item.resolve() != sidecar.resolve():
+            return {
+                "TagsList": ["People/Mom"],
+                "HierarchicalSubject": ["People|Mom"],
+                "Subject": ["Mom"],
+            }
+        return {
+            "TagsList": ["People/Unknown/Person_001", "People/Mom"],
+            "HierarchicalSubject": ["People|Unknown|Person_001", "People|Mom"],
+            "Subject": ["Person_001", "Mom"],
+        }
+
+    monkeypatch.setattr(writer, "read_tag_fields", fake_read_tag_fields)
+
+    calls: list[list[object]] = []
+
+    def fake_run_command(args, timeout):
+        calls.append(args)
+        target = Path(args[-1])
+        if target.exists():
+            target.write_text(" persons", encoding="utf-8")
+        return type("Result", (), {"stdout": ""})()
+
+    monkeypatch.setattr(metadata_module, "run_command", fake_run_command)
+
+    result = writer.remove_tags(video, ["People/Unknown/Person_001"])
+
+    assert result.sidecar == sidecar
+    assert result.removed_tags == ("People/Unknown/Person_001",)
+    assert result.remaining_tags == ("People/Mom",)
+    assert "-XMP-digiKam:TagsList-=People/Unknown/Person_001" in calls[0]
+    assert "-XMP-lr:HierarchicalSubject-=People|Unknown|Person_001" in calls[0]
+    assert "-XMP-dc:Subject-=Person_001" in calls[0]
+    assert not any("People/Mom" in str(value) for value in calls[0])
+
+
+def test_remove_tags_no_op_for_absent_tags(tmp_path: Path, monkeypatch) -> None:
+    video = tmp_path / "clip.mp4"
+    sidecar = Path(f"{video}.xmp")
+    video.write_bytes(b"video")
+    sidecar.write_text("original", encoding="utf-8")
+    writer = ExifToolSidecarWriter(Path("exiftool"))
+
+    monkeypatch.setattr(
+        writer,
+        "read_tag_fields",
+        lambda item: {
+            "TagsList": ["People/Mom"],
+            "HierarchicalSubject": ["People|Mom"],
+            "Subject": ["Mom"],
+        },
+    )
+    monkeypatch.setattr(metadata_module, "run_command", lambda args, timeout: None)
+
+    result = writer.remove_tags(video, ["People/Unknown/Person_001"])
+    assert result.removed_tags == ()
+    assert result.remaining_tags == ("People/Mom",)
+
+
+def test_remove_tags_raises_when_sidecar_missing(tmp_path: Path) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    writer = ExifToolSidecarWriter(Path("exiftool"))
+
+    with pytest.raises(FileNotFoundError, match="sidecar does not exist"):
+        writer.remove_tags(video, ["People/Unknown/Person_001"])
+
+
+def test_remove_tags_rejects_invalid_paths_before_subprocess(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "clip.mp4"
+    sidecar = Path(f"{video}.xmp")
+    video.write_bytes(b"video")
+    sidecar.write_text("original", encoding="utf-8")
+    writer = ExifToolSidecarWriter(Path("exiftool"))
+
+    with pytest.raises(ValueError, match="tag path segment"):
+        writer.remove_tags(video, ["People/A|lice"])

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -99,7 +100,7 @@ class AutoFinalizeService:
         ] = load_completed_videos,
         mark_completed: Callable[..., CompletedVideo] = mark_job_completed,
         job_id: Callable[[Path], str] = job_id_for_video,
-        lock: Callable[[Path], Iterator[None]] = staging_apply_lock,
+        lock: Callable[[Path], AbstractContextManager[None]] = staging_apply_lock,
     ) -> None:
         if options.sample_seconds <= 0:
             raise ValueError("sample_seconds must be positive")
@@ -324,6 +325,7 @@ class AutoFinalizeService:
                     removed_proxy_files=0,
                 )
 
+        job: VideoFaceJob | None = None
         try:
             if apply:
                 prepared = self.prepare_job(

@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -97,7 +98,7 @@ class ClusterSession:
     def _nearest(
         self,
         embedding: np.ndarray,
-        candidates: iter[tuple[str, np.ndarray]],
+        candidates: Iterator[tuple[str, np.ndarray]],
     ) -> str | None:
         threshold = self._store.distance_threshold
         best_id: str | None = None
@@ -216,6 +217,8 @@ class FaceClusterStore:
             )
 
         loaded_root = data.get("unknown_root")
+        if not isinstance(loaded_root, str):
+            raise ValueError("unknown_root must be a string")
         if loaded_root != unknown_root:
             raise ValueError(
                 f"unknown root mismatch: store has {loaded_root!r}, "

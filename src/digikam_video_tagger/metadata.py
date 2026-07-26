@@ -166,6 +166,19 @@ class ExifToolSidecarWriter:
                 sidecar, (), tuple(sorted(fields["TagsList"], key=str.casefold))
             )
 
+        # dc:Subject stores flat leaf names shared across every hierarchical tag.
+        # Only retract a leaf when no remaining tag still references it, so removing
+        # a tool-owned placeholder never strips a Subject value owned by another tag.
+        remaining_tags_list = current_tags_list - set(to_remove)
+        referenced_subject_leaves = {
+            tag.rsplit("/", 1)[-1] for tag in remaining_tags_list
+        }
+        subject_leaves_to_remove = {
+            tag.rsplit("/", 1)[-1]
+            for tag in to_remove
+            if tag.rsplit("/", 1)[-1] not in referenced_subject_leaves
+        }
+
         descriptor, temp_name = tempfile.mkstemp(
             prefix=f".{sidecar.name}.", suffix=".xmp", dir=sidecar.parent
         )
@@ -183,9 +196,10 @@ class ExifToolSidecarWriter:
                     [
                         f"-XMP-digiKam:TagsList-={tag}",
                         f"-XMP-lr:HierarchicalSubject-={tag.replace('/', '|')}",
-                        f"-XMP-dc:Subject-={tag.rsplit('/', 1)[-1]}",
                     ]
                 )
+            for leaf in sorted(subject_leaves_to_remove, key=str.casefold):
+                args.append(f"-XMP-dc:Subject-={leaf}")
             args.append(temp_path)
             run_command(args, timeout=120)
 
@@ -202,9 +216,9 @@ class ExifToolSidecarWriter:
                     raise RuntimeError(
                         f"ExifTool did not remove HierarchicalSubject: {hierarchical_expected}"
                     )
-                subject = tag.rsplit("/", 1)[-1]
-                if subject in subjects:
-                    raise RuntimeError(f"ExifTool did not remove Subject: {subject}")
+            for leaf in subject_leaves_to_remove:
+                if leaf in subjects:
+                    raise RuntimeError(f"ExifTool did not remove Subject: {leaf}")
 
             os.replace(temp_path, sidecar)
         finally:

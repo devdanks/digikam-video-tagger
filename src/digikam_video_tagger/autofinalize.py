@@ -186,17 +186,24 @@ class AutoFinalizeService:
 
     def _apply_resolution(self, candidates: dict[str, str]) -> int:
         resolved_count = 0
+        failures: list[str] = []
         for placeholder, name in candidates.items():
             owners = self._owners_of_placeholder(placeholder)
-            failures = False
+            placeholder_failed = False
             for _job_id, entry in owners:
                 try:
                     self._replace_placeholder(entry, placeholder, name)
-                except Exception:
-                    failures = True
-            if not failures:
+                except Exception as error:
+                    placeholder_failed = True
+                    failures.append(f"{placeholder} on {entry.source_path}: {error}")
+            if not placeholder_failed:
                 self._mark_cluster_resolved(placeholder, name)
                 resolved_count += 1
+        if failures:
+            raise RuntimeError(
+                "Placeholder resolution failed for "
+                f"{len(failures)} owner(s): " + "; ".join(failures)
+            )
         return resolved_count
 
     def _attach_proposals(
@@ -327,7 +334,7 @@ class AutoFinalizeService:
                 )
 
         job: VideoFaceJob | None = None
-        job: VideoFaceJob | None = None
+        dry_run: _DryRunFrames | None = None
         try:
             if apply:
                 prepared = self.prepare_job(
@@ -347,8 +354,6 @@ class AutoFinalizeService:
             analysis = self._analyze_frames(frames)
 
             if not apply:
-                dry_run = self._dry_run_frames(video, active_job)
-                dry_run.cleanup()
                 return self._build_dry_run_result(
                     video, job_id, analysis, cluster_session=None
                 )
@@ -371,6 +376,9 @@ class AutoFinalizeService:
                 removed_proxy_files=0,
                 error=str(error),
             )
+        finally:
+            if dry_run is not None:
+                dry_run.cleanup()
 
     def _active_job_for_video(self, video: Path) -> VideoFaceJob | None:
         jobs = self.discover_jobs(self.staging_dir, sources={video})

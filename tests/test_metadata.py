@@ -190,3 +190,56 @@ def test_remove_tags_rejects_invalid_paths_before_subprocess(
 
     with pytest.raises(ValueError, match="tag path segment"):
         writer.remove_tags(video, ["People/A|lice"])
+
+
+def test_remove_tags_preserves_shared_dc_subject_leaf(
+    tmp_path: Path, monkeypatch
+) -> None:
+    video = tmp_path / "clip.mp4"
+    sidecar = Path(f"{video}.xmp")
+    video.write_bytes(b"video")
+    sidecar.write_text("original", encoding="utf-8")
+    writer = ExifToolSidecarWriter(Path("exiftool"))
+
+    def fake_read_tag_fields(item: Path) -> dict[str, list[str]]:
+        if item.resolve() != sidecar.resolve():
+            # Temp copy after removal: the tool-owned placeholder is gone, but a
+            # different retained tag still owns the shared Person_001 leaf.
+            return {
+                "TagsList": ["Events/Person_001"],
+                "HierarchicalSubject": ["Events|Person_001"],
+                "Subject": ["Person_001"],
+            }
+        return {
+            "TagsList": ["People/Unknown/Person_001", "Events/Person_001"],
+            "HierarchicalSubject": [
+                "People|Unknown|Person_001",
+                "Events|Person_001",
+            ],
+            "Subject": ["Person_001"],
+        }
+
+    monkeypatch.setattr(writer, "read_tag_fields", fake_read_tag_fields)
+
+    calls: list[list[object]] = []
+
+    def fake_run_command(args, timeout):
+        calls.append(args)
+        target = Path(args[-1])
+        if target.exists():
+            target.write_text(" patched", encoding="utf-8")
+        return type("Result", (), {"stdout": ""})()
+
+    monkeypatch.setattr(metadata_module, "run_command", fake_run_command)
+
+    result = writer.remove_tags(video, ["People/Unknown/Person_001"])
+
+    assert result.removed_tags == ("People/Unknown/Person_001",)
+    assert result.remaining_tags == ("Events/Person_001",)
+    assert "-XMP-digiKam:TagsList-=People/Unknown/Person_001" in calls[0]
+    assert "-XMP-lr:HierarchicalSubject-=People|Unknown|Person_001" in calls[0]
+    # The Person_001 leaf is still owned by Events/Person_001, so it must be preserved.
+    assert "-XMP-dc:Subject-=Person_001" not in calls[0]
+    assert not any(
+        isinstance(v, str) and v.startswith("-XMP-dc:Subject-=") for v in calls[0]
+    )

@@ -463,3 +463,101 @@ def test_no_tags_apply_still_marks_completion_and_cleans(
     assert "proxy-cleanup" in events
     assert writer.writes == []
     assert store.saved is False
+
+
+def test_dry_run_extracts_frames_at_most_once(make_service) -> None:
+    service, video, _store, _writer, _tagger = make_service(frame_detections=[[]])
+    original = service.sampler.extract_frames
+    calls = {"count": 0}
+
+    def counting_extract(video, **kwargs):
+        calls["count"] += 1
+        return original(video, **kwargs)
+
+    service.sampler.extract_frames = counting_extract
+    service.run([video], apply=False, reprocess_completed=False)
+    assert calls["count"] == 1
+
+
+def test_resolution_failure_surfaces_and_leaves_cluster_unresolved(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / "staging"
+    store = FaceClusterStore.empty(
+        model_fingerprint="a" * 64,
+        distance_threshold=0.20,
+        unknown_root="People/Unknown",
+    )
+    session = store.begin_session()
+    token = session.assign(unit(0))
+    session.commit({token})
+    store.save(tmp_path / "clusters.json")
+
+    videos: list[Path] = []
+    for name in ("a.mp4", "b.mp4"):
+        video = tmp_path / name
+        video.write_bytes(b"video")
+        sidecar = Path(f"{video}.xmp")
+        sidecar.write_text("xmp", encoding="utf-8")
+        stat = video.stat()
+        rewrite_completed_entry(
+            staging,
+            CompletedVideo(
+                job_id=job_id_for_video(video),
+                source_video=str(video.resolve()),
+                source_size=stat.st_size,
+                source_mtime_ns=stat.st_mtime_ns,
+                applied_at="2026-01-01T00:00:00+00:00",
+                people=("People/Unknown/Person_001",),
+                sidecar=str(sidecar),
+                workflow="autofinalize",
+                managed_placeholders=("People/Unknown/Person_001",),
+                managed_placeholder_root="People/Unknown",
+                cluster_store_id=store.store_id,
+            ),
+        )
+        videos.append(video)
+
+    class FailingRemoveWriter:
+        def __init__(self) -> None:
+            self.writes: list[tuple[Path, list[str]]] = []
+            self.removals: list[tuple[Path, list[str]]] = []
+
+        def sidecar_path(self, video: Path) -> Path:
+            return Path(f"{video}.xmp")
+
+        def write_tags(self, video: Path, tags: list[str]) -> object:
+            self.writes.append((video, tags))
+            return type("Result", (), {"sidecar": self.sidecar_path(video)})()
+
+        def remove_tags(self, video: Path, tags: list[str]) -> object:
+            self.removals.append((video, tags))
+            raise RuntimeError("exiftool remove failed")
+
+    tagger = FakeTagger([[]], gallery=[PersonEmbedding(1, "Mom", unit(0))])
+    writer = FailingRemoveWriter()
+    service = AutoFinalizeService(
+        staging_dir=staging,
+        sampler=FakeSampler([]),
+        face_tagger=tagger,
+        cluster_store=store,
+        cluster_store_path=tmp_path / "clusters.json",
+        sidecar_writer=writer,
+        options=AutoFinalizeOptions(
+            sample_seconds=1.0,
+            max_frames=10,
+            max_dimension=1280,
+            min_person_hits=1,
+            min_frame_ratio=0.01,
+            resolution_min_observations=1,
+            resolution_margin=0.001,
+        ),
+        lock=null_lock,
+    )
+
+    with pytest.raises(RuntimeError, match="Placeholder resolution failed"):
+        service.run(videos, apply=True, reprocess_completed=False)
+
+    assert store.clusters["Person_001"].resolved_name is None
+    assert len(writer.writes) == 2
+    assert len(writer.removals) == 2

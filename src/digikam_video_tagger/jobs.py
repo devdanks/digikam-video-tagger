@@ -268,7 +268,22 @@ def mark_job_completed(
         managed_placeholder_root=managed_placeholder_root,
         cluster_store_id=cluster_store_id,
     )
-    existing[job.job_id] = entry
+    return _write_completed_entry(staging_dir, entry, existing)
+
+
+def rewrite_completed_entry(staging_dir: Path, entry: CompletedVideo) -> CompletedVideo:
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    existing = load_completed_videos(staging_dir)
+    return _write_completed_entry(staging_dir, entry, existing)
+
+
+def _write_completed_entry(
+    staging_dir: Path,
+    entry: CompletedVideo,
+    existing: dict[str, CompletedVideo],
+) -> CompletedVideo:
+    ledger = staging_dir / COMPLETED_NAME
+    existing[entry.job_id] = entry
     payload = {
         "schema_version": COMPLETED_VERSION,
         "videos": {

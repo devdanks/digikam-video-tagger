@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import cv2
@@ -19,6 +20,8 @@ from .jobs import (
     load_completed_videos,
     mark_job_completed,
     prepare_job,
+    rewrite_completed_entry,
+    staging_apply_lock,
 )
 from .metadata import ExifToolSidecarWriter, MetadataWriteResult
 from .models import FaceDetection, FaceTagger
@@ -32,6 +35,8 @@ class AutoFinalizeOptions:
     max_dimension: int
     min_person_hits: int
     min_frame_ratio: float
+    resolution_min_observations: int = 2
+    resolution_margin: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,7 @@ class AutoFinalizeService:
         ] = load_completed_videos,
         mark_completed: Callable[..., CompletedVideo] = mark_job_completed,
         job_id: Callable[[Path], str] = job_id_for_video,
+        lock: Callable[[Path], Iterator[None]] = staging_apply_lock,
     ) -> None:
         if options.sample_seconds <= 0:
             raise ValueError("sample_seconds must be positive")
@@ -105,6 +111,10 @@ class AutoFinalizeService:
             raise ValueError("min_person_hits must be positive")
         if not 0.0 <= options.min_frame_ratio <= 1.0:
             raise ValueError("min_frame_ratio must be between 0 and 1")
+        if options.resolution_min_observations < 1:
+            raise ValueError("resolution_min_observations must be positive")
+        if not 0.0 <= options.resolution_margin <= 1.0:
+            raise ValueError("resolution_margin must be between 0 and 1")
 
         self.staging_dir = staging_dir
         self.sampler = sampler
@@ -118,6 +128,7 @@ class AutoFinalizeService:
         self.load_completed = load_completed
         self.mark_completed = mark_completed
         self.job_id = job_id
+        self.lock = lock
 
     def run(
         self,
@@ -126,12 +137,25 @@ class AutoFinalizeService:
         apply: bool,
         reprocess_completed: bool,
     ) -> tuple[list[AutoFinalizeVideoResult], AutoFinalizeSummary]:
+        candidates = self._resolution_candidates()
         results: list[AutoFinalizeVideoResult] = []
-        for video in videos:
-            result = self._process_video(
-                video, apply=apply, reprocess_completed=reprocess_completed
-            )
-            results.append(result)
+        if apply:
+            with staging_apply_lock(self.staging_dir):
+                resolved_count = self._apply_resolution(candidates)
+                for video in videos:
+                    result = self._process_video(
+                        video,
+                        apply=True,
+                        reprocess_completed=reprocess_completed,
+                    )
+                    results.append(result)
+        else:
+            for video in videos:
+                result = self._process_video(
+                    video, apply=False, reprocess_completed=reprocess_completed
+                )
+                result = self._attach_proposals(result, candidates)
+                results.append(result)
 
         summary = AutoFinalizeSummary(
             videos=len(results),
@@ -141,10 +165,109 @@ class AutoFinalizeService:
             clustered_people=len(
                 {name for r in results for name in r.placeholder_people}
             ),
-            resolved_people=sum(len(r.proposed_replacements) for r in results),
+            resolved_people=sum(len(r.proposed_replacements) for r in results)
+            if not apply
+            else resolved_count,
             failed=sum(1 for r in results if r.error is not None),
         )
         return results, summary
+
+    def _resolution_candidates(self) -> dict[str, str]:
+        if not self.face_tagger.gallery:
+            return {}
+        return self.cluster_store.resolution_candidates(
+            self.face_tagger.gallery,
+            recognition_distance=self.face_tagger.recognition_distance,
+            min_observations=self.options.resolution_min_observations,
+            min_margin=self.options.resolution_margin,
+        )
+
+    def _apply_resolution(self, candidates: dict[str, str]) -> int:
+        resolved_count = 0
+        for placeholder, name in candidates.items():
+            owners = self._owners_of_placeholder(placeholder)
+            failures = False
+            for _job_id, entry in owners:
+                try:
+                    self._replace_placeholder(entry, placeholder, name)
+                except Exception:
+                    failures = True
+            if not failures:
+                self._mark_cluster_resolved(placeholder, name)
+                resolved_count += 1
+        return resolved_count
+
+    def _attach_proposals(
+        self,
+        result: AutoFinalizeVideoResult,
+        candidates: dict[str, str],
+    ) -> AutoFinalizeVideoResult:
+        proposals = [
+            (placeholder, candidates[placeholder])
+            for placeholder in result.placeholder_people
+            if placeholder in candidates
+        ]
+        if not proposals:
+            return result
+        from dataclasses import replace
+
+        return replace(result, proposed_replacements=tuple(proposals))
+
+    def _owners_of_placeholder(
+        self, placeholder: str
+    ) -> list[tuple[str, CompletedVideo]]:
+        owners: list[tuple[str, CompletedVideo]] = []
+        for job_id, entry in self.load_completed(self.staging_dir).items():
+            if entry.workflow != "autofinalize":
+                continue
+            if entry.cluster_store_id != self.cluster_store.store_id:
+                continue
+            if placeholder not in entry.managed_placeholders:
+                continue
+            if not entry.source_is_unchanged():
+                continue
+            owners.append((job_id, entry))
+        return owners
+
+    def _replace_placeholder(
+        self,
+        entry: CompletedVideo,
+        placeholder: str,
+        name: str,
+    ) -> None:
+        video = entry.source_path
+        known_tag = people_tag(name)
+        self.sidecar_writer.write_tags(video, [known_tag])
+        self.sidecar_writer.remove_tags(video, [placeholder])
+        updated_people = sorted(
+            {*entry.people, known_tag} - {placeholder},
+            key=str.casefold,
+        )
+        updated_placeholders = tuple(
+            p for p in entry.managed_placeholders if p != placeholder
+        )
+        new_entry = CompletedVideo(
+            job_id=entry.job_id,
+            source_video=entry.source_video,
+            source_size=entry.source_size,
+            source_mtime_ns=entry.source_mtime_ns,
+            applied_at=datetime.now(UTC).isoformat(),
+            people=tuple(updated_people),
+            sidecar=entry.sidecar,
+            workflow=entry.workflow,
+            managed_placeholders=updated_placeholders,
+            managed_placeholder_root=entry.managed_placeholder_root,
+            cluster_store_id=entry.cluster_store_id,
+        )
+        rewrite_completed_entry(self.staging_dir, new_entry)
+
+    def _mark_cluster_resolved(self, placeholder: str, name: str) -> None:
+        cluster_id = placeholder.rsplit("/", 1)[-1]
+        cluster = self.cluster_store.clusters.get(cluster_id)
+        if cluster is None:
+            return
+        cluster.resolved_name = name
+        self.cluster_store.save(self.cluster_store_path)
 
     def _process_video(
         self,
@@ -156,6 +279,30 @@ class AutoFinalizeService:
         video = video.resolve()
         job_id = self.job_id(video)
         active_job = self._active_job_for_video(video)
+
+        if apply and active_job is not None and not reprocess_completed:
+            completed = completed_video_for_source_with_loader(
+                self.staging_dir, video, self.load_completed
+            )
+            if (
+                completed is not None
+                and completed.cluster_store_id == self.cluster_store.store_id
+            ):
+                removed = active_job.remove_generated_files()
+                return AutoFinalizeVideoResult(
+                    source_video=video,
+                    job_id=job_id,
+                    frame_count=0,
+                    unreadable_frames=0,
+                    face_frames=0,
+                    known_people=completed.people,
+                    placeholder_people=completed.managed_placeholders,
+                    proposed_replacements=(),
+                    completed=True,
+                    applied=True,
+                    sidecar=Path(completed.sidecar) if completed.sidecar else None,
+                    removed_proxy_files=len(removed),
+                )
 
         if active_job is None and not reprocess_completed:
             completed = completed_video_for_source_with_loader(

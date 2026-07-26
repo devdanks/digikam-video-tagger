@@ -361,10 +361,6 @@ def prepare(args: argparse.Namespace) -> int:
 
 
 def finalize(args: argparse.Namespace) -> int:
-    if getattr(args, "complete_without_people", False) and not args.apply:
-        print("--complete-without-people requires --apply", file=sys.stderr)
-        return 2
-
     selected_sources: set[Path] | None = None
     if args.paths:
         discovered = _discover_videos(args.paths, args.recursive)
@@ -408,10 +404,8 @@ def finalize(args: argparse.Namespace) -> int:
     failures = 0
     ready = 0
     applied = 0
-    completed_without_people = 0
     pending_unscanned = 0
     pending_uncatalogued = 0
-    pending_unnamed = 0
     if not args.json:
         print(f"Found {total} proxy job(s) in the batch.")
 
@@ -447,11 +441,16 @@ def finalize(args: argparse.Namespace) -> int:
                 "frames": len(job.frames),
                 "catalogued_frames": len(job.frames) - len(not_scanned),
                 "confirmed_people": people,
-                "ready": not not_scanned and bool(people),
+                "ready": not not_scanned,
                 "applied": False,
             }
 
             if not_scanned:
+                if args.apply:
+                    raise RuntimeError(
+                        "Cannot apply an incomplete job: "
+                        f"{len(not_scanned)} proxy frame(s) are not catalogued in digiKam"
+                    )
                 if not_catalogued:
                     pending_uncatalogued += 1
                 else:
@@ -473,66 +472,41 @@ def finalize(args: argparse.Namespace) -> int:
                             f"  {len(not_scanned)} of {len(job.frames)} proxy frames are not in digiKam yet"
                         )
                 continue
-            if not people:
-                if args.apply and getattr(args, "complete_without_people", False):
-                    mark_job_completed(job, [], None)
-                    removed = [] if args.keep_frames else job.remove_generated_files()
-                    payload["completed_without_people"] = True
-                    payload["removed_proxy_files"] = len(removed)
-                    completed_without_people += 1
-                    if args.json:
-                        print(json.dumps(payload, ensure_ascii=False))
-                    elif not args.summary_only:
-                        print(
-                            f"[{index}/{total} COMPLETED-NO-PEOPLE] {job.source_path}"
-                        )
-                        if not args.keep_frames:
-                            print(
-                                "  generated proxy frames deleted; no video sidecar was needed"
-                            )
-                else:
-                    pending_unnamed += 1
-                    if args.json:
-                        print(json.dumps(payload, ensure_ascii=False))
-                    elif not args.summary_only:
-                        print(f"[{index}/{total} PENDING] {job.source_path}")
-                        print(
-                            "  proxy frames are catalogued, but no confirmed person face regions were found"
-                        )
-                continue
-
             ready += 1
             if args.apply:
-                metadata = writer.write_tags(job.source_path, people)
                 payload["applied"] = True
-                payload["sidecar"] = str(metadata.sidecar)
-                payload["added_tags"] = list(metadata.added_tags)
-                mark_job_completed(job, people, metadata.sidecar)
-                removed = [] if args.keep_frames else job.remove_generated_files()
+                if people:
+                    metadata = writer.write_tags(job.source_path, people)
+                    payload["sidecar"] = str(metadata.sidecar)
+                    payload["added_tags"] = list(metadata.added_tags)
+                    mark_job_completed(job, people, metadata.sidecar)
+                    state = "APPLIED"
+                else:
+                    mark_job_completed(job, [], None)
+                    state = "APPLIED-NO-PEOPLE"
+                removed = job.remove_generated_files()
                 payload["removed_proxy_files"] = len(removed)
-                state = "APPLIED"
                 applied += 1
             else:
-                state = "READY"
+                state = "READY" if people else "READY-NO-PEOPLE"
 
             if args.json:
                 print(json.dumps(payload, ensure_ascii=False))
             elif not args.summary_only:
                 print(f"[{index}/{total} {state}] {job.source_path}")
-                print(f"  confirmed_people={', '.join(people)}")
+                if people:
+                    print(f"  confirmed_people={', '.join(people)}")
                 if args.apply:
-                    print(f"  sidecar={payload['sidecar']}")
-                    if not args.keep_frames:
-                        print(
-                            "  generated proxy frames deleted; rescan the staging album in digiKam"
-                        )
+                    if people:
+                        print(f"  sidecar={payload['sidecar']}")
+                    print("  generated proxy frames deleted; rescan the staging album in digiKam")
         except Exception as error:
             failures += 1
             print(
                 f"[{index}/{total} ERROR] {job.source_path}: {error}", file=sys.stderr
             )
 
-    pending = pending_unscanned + pending_uncatalogued + pending_unnamed
+    pending = pending_unscanned + pending_uncatalogued
     completed_count = _completed_count(args.staging_dir, selected_sources)
     summary = {
         "type": "summary",
@@ -540,12 +514,10 @@ def finalize(args: argparse.Namespace) -> int:
         "jobs": total,
         "ready": ready,
         "applied": applied,
-        "completed_without_people": completed_without_people,
         "completed": completed_count,
         "pending": pending,
         "pending_unscanned": pending_unscanned,
         "pending_uncatalogued": pending_uncatalogued,
-        "pending_unnamed": pending_unnamed,
         "failed": failures,
     }
     if args.json:
@@ -553,8 +525,6 @@ def finalize(args: argparse.Namespace) -> int:
     else:
         if args.apply:
             prefix = f"{total} job(s) checked, {completed_count} completed, {applied} applied"
-            if completed_without_people:
-                prefix += f", {completed_without_people} completed without people"
         else:
             prefix = (
                 f"{total} active job(s), {completed_count} completed, {ready} ready"
@@ -562,13 +532,10 @@ def finalize(args: argparse.Namespace) -> int:
         print(
             "\nBatch summary: "
             f"{prefix}, {pending} pending "
-            f"({pending_unscanned} unscanned, {pending_uncatalogued} outside collection roots, "
-            f"{pending_unnamed} without confirmed people), "
+            f"({pending_unscanned} unscanned, {pending_uncatalogued} outside collection roots), "
             f"{failures} failed."
         )
 
-    # Pending jobs are an expected partial-batch state: ready jobs can be
-    # applied while videos without confirmed people remain for later review.
     return 1 if failures else 0
 
 
@@ -683,7 +650,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Video file(s) or directory tree(s); directories recurse by default",
     )
     prepare_parser.add_argument(
-        "--staging-dir", type=_path, default=DEFAULT_STAGING_DIR
+        "--staging-dir",
+        type=_path,
+        default=DEFAULT_STAGING_DIR,
+        help=argparse.SUPPRESS,
     )
     prepare_parser.add_argument(
         "--recursive",
@@ -719,7 +689,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional source file(s) or directory tree(s); omit to process all jobs",
     )
     finalize_parser.add_argument(
-        "--staging-dir", type=_path, default=DEFAULT_STAGING_DIR
+        "--staging-dir",
+        type=_path,
+        default=DEFAULT_STAGING_DIR,
+        help=argparse.SUPPRESS,
     )
     finalize_parser.add_argument(
         "--recursive",
@@ -728,21 +701,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recurse through every supplied directory (default: enabled)",
     )
     finalize_parser.add_argument(
-        "--apply", action="store_true", help="Write video XMP sidecars"
-    )
-    finalize_parser.add_argument(
-        "--complete-without-people",
+        "--apply",
         action="store_true",
-        help=(
-            "With --apply, record fully scanned jobs with no confirmed People regions as "
-            "reviewed and remove their generated frames"
-        ),
+        help="Finalize every fully catalogued job, write XMP sidecars, and remove proxies",
     )
-    finalize_parser.add_argument(
-        "--keep-frames",
-        action="store_true",
-        help="Keep generated proxy frames after successful application",
-    )
+
     finalize_parser.add_argument(
         "--summary-only",
         action="store_true",
@@ -762,7 +725,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=_path,
         help="Optional source file(s) or directory tree(s); omit to summarize all jobs",
     )
-    status_parser.add_argument("--staging-dir", type=_path, default=DEFAULT_STAGING_DIR)
+    status_parser.add_argument(
+        "--staging-dir",
+        type=_path,
+        default=DEFAULT_STAGING_DIR,
+        help=argparse.SUPPRESS,
+    )
     status_parser.add_argument(
         "--recursive",
         action=argparse.BooleanOptionalAction,
@@ -773,8 +741,6 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.set_defaults(
         handler=finalize,
         apply=False,
-        complete_without_people=False,
-        keep_frames=True,
         summary_only=True,
         status_mode=True,
     )

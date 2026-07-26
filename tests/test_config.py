@@ -1,6 +1,8 @@
 from pathlib import Path
 
 from digikam_video_tagger.config import (
+    DEFAULT_STAGING_DIR,
+    LOCAL_APP_DATA,
     digikam_sidecar_reading_enabled,
     read_kconfig_boolean,
 )
@@ -49,3 +51,7 @@ def test_digikam_sidecar_reading_enabled_accepts_current_key(tmp_path: Path) -> 
     )
 
     assert digikam_sidecar_reading_enabled(config) is True
+
+
+def test_default_staging_directory_is_managed_by_the_application() -> None:
+    assert DEFAULT_STAGING_DIR == LOCAL_APP_DATA / "digikam-video-tagger" / "staging"

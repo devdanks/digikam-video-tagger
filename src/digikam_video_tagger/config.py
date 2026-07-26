@@ -41,10 +41,9 @@ DEFAULT_EXIFTOOL = _environment_path(
     "DIGIKAM_VIDEO_TAGGER_EXIFTOOL",
     DISCOVERED_EXIFTOOL if DISCOVERED_EXIFTOOL else Path("exiftool.exe"),
 )
-DEFAULT_STAGING_DIR = _environment_path(
-    "DIGIKAM_VIDEO_TAGGER_STAGING_DIR",
-    Path.home() / "Pictures" / "_digikam_video_faces",
-)
+# Proxy jobs are managed transient data. Keep them in an application-managed
+# location so they survive face review and can be deleted after finalization.
+DEFAULT_STAGING_DIR = LOCAL_APP_DATA / "digikam-video-tagger" / "staging"
 DEFAULT_DIGIKAM_CONFIG = _environment_path(
     "DIGIKAM_VIDEO_TAGGER_DIGIKAM_CONFIG",
     LOCAL_APP_DATA / "digikamrc",

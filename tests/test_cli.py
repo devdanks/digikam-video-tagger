@@ -50,7 +50,7 @@ def test_status_is_successful_when_no_active_jobs(tmp_path: Path, capsys) -> Non
     assert "0 active job(s)" in capsys.readouterr().out
 
 
-def test_finalize_partial_batch_is_successful_when_remaining_job_is_pending(
+def test_finalize_apply_fails_when_proxy_frames_are_unscanned(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     source = tmp_path / "pending.mp4"
@@ -64,7 +64,7 @@ def test_finalize_partial_batch_is_successful_when_remaining_job_is_pending(
         frames=(object(),),
         source_is_unchanged=lambda: True,
     )
-    face = SimpleNamespace(frame=frame, image_id=1, person_tag_paths=())
+    face = SimpleNamespace(frame=frame, image_id=None, person_tag_paths=())
     catalog = SimpleNamespace(confirmed_faces_for_frames=lambda paths: [face])
     monkeypatch.setattr(cli, "discover_jobs", lambda staging, sources: [job])
     monkeypatch.setattr(cli, "DigiKamCatalog", lambda config: catalog)
@@ -73,13 +73,12 @@ def test_finalize_partial_batch_is_successful_when_remaining_job_is_pending(
         ["finalize", "--staging-dir", str(tmp_path), "--apply"]
     )
 
-    assert args.handler(args) == 0
-    output = capsys.readouterr().out
-    assert "1 job(s) checked" in output
-    assert "1 pending" in output
+    assert args.handler(args) == 1
+    output = capsys.readouterr().err
+    assert "Cannot apply an incomplete job" in output
 
 
-def test_finalize_can_complete_reviewed_job_without_people(
+def test_finalize_apply_completes_scanned_job_without_people(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     source = tmp_path / "reviewed.mp4"
@@ -110,18 +109,12 @@ def test_finalize_can_complete_reviewed_job_without_people(
     monkeypatch.setattr(cli, "_completed_count", lambda staging, sources: 1)
 
     args = build_parser().parse_args(
-        [
-            "finalize",
-            "--staging-dir",
-            str(tmp_path),
-            "--apply",
-            "--complete-without-people",
-        ]
+        ["finalize", "--staging-dir", str(tmp_path), "--apply"]
     )
 
     assert args.handler(args) == 0
     assert recorded == [(job, [], None)]
     assert removed == [frame]
     output = capsys.readouterr().out
-    assert "COMPLETED-NO-PEOPLE" in output
-    assert "1 completed without people" in output
+    assert "APPLIED-NO-PEOPLE" in output
+    assert "1 applied" in output

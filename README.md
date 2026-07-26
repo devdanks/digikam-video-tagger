@@ -78,6 +78,10 @@ uv run digikam-video-tagger doctor
 `config.local.ps1` is ignored by Git. Every setting can also be supplied as a CLI option. Run
 `uv run digikam-video-tagger --help` and the relevant subcommand's `--help` for details.
 
+Proxy frames are stored automatically under
+`%LOCALAPPDATA%\digikam-video-tagger\staging`; no staging path needs to be configured. Add that
+directory as a digiKam Album Root once so digiKam can catalog the temporary frames.
+
 Use `doctor --object-model xl` before selecting the XL object model to validate `yolo11x.onnx`.
 The legacy `--allow-cpu-fallback` permits CPU fallback for both backends; prefer the independent
 `--no-ffmpeg-cuda` and `--no-opencl` controls when only one backend needs to be relaxed.
@@ -92,13 +96,12 @@ uv run digikam-video-tagger prepare "D:\Media\Videos"
 
 In digiKam:
 
-1. Scan for new items under `_digikam_video_faces`.
+1. Scan for new items under `%LOCALAPPDATA%\digikam-video-tagger\staging`.
 2. Detect and recognize faces on that album, including all subalbums.
 3. Confirm or assign People names and click **Apply**.
 
-The staging directory must be inside a registered digiKam Album Root. If `status` or `finalize`
-reports `STAGING-NOT-CATALOGUED`, add the staging directory as a collection root and rescan before
-continuing.
+If `status` reports `STAGING-NOT-CATALOGUED`, the managed staging directory is not registered as a
+digiKam Album Root; add it as a collection root and rescan before continuing.
 
 Inspect the batch without writing or deleting anything:
 
@@ -106,22 +109,16 @@ Inspect the batch without writing or deleting anything:
 uv run digikam-video-tagger status "D:\Media\Videos"
 ```
 
-Apply confirmed People tags and remove only successfully processed proxies:
+Finalize every fully catalogued video. This writes any confirmed People tags, records catalogued
+videos with no People tags as reviewed, and removes all generated proxy frames:
 
 ```powershell
 uv run digikam-video-tagger finalize "D:\Media\Videos" --apply
 ```
 
-After reviewing the whole proxy batch, complete scanned videos that contain no confirmed people and
-remove their temporary frames:
-
-```powershell
-uv run digikam-video-tagger finalize "D:\Media\Videos" `
-  --apply --complete-without-people --summary-only
-```
-
-Reread metadata for the source-video album in digiKam afterward. Use `--keep-frames` to retain
-generated JPEGs, or `prepare --reprocess-completed` to deliberately scan completed videos again.
+`--apply` fails rather than deleting anything for a video whose proxy frames have not yet been
+catalogued. Reread metadata for the source-video album in digiKam afterward. Use
+`prepare --reprocess-completed` to deliberately scan completed videos again.
 
 ## Direct auto-tagging (`tag`)
 
@@ -157,7 +154,8 @@ recognition reads digiKam's SFace training embeddings (`DigiKamFaceGallery`) and
 - Metadata is merged into `filename.ext.xmp` sidecars atomically.
 - Existing embedded and sidecar tags are deduplicated, and all three digiKam-compatible tag fields
   (`TagsList`, `HierarchicalSubject`, and `Subject`) are verified before a sidecar is replaced.
-- Cleanup removes only manifest-owned proxy files and their sidecars.
+- `finalize --apply` removes only manifest-owned proxy files and their sidecars after a video is
+  recorded as complete.
 - Jobs stop if a source video changes after extraction.
 
 ## Development

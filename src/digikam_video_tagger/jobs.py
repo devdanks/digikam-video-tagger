@@ -238,7 +238,6 @@ def mark_job_completed(
 ) -> CompletedVideo:
     staging_dir = job.job_dir.parent
     staging_dir.mkdir(parents=True, exist_ok=True)
-    ledger = staging_dir / COMPLETED_NAME
     existing = load_completed_videos(staging_dir)
 
     for tag in people:

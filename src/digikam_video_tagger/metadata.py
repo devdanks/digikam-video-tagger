@@ -18,6 +18,13 @@ class MetadataWriteResult:
     existing_tags: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MetadataRemovalResult:
+    sidecar: Path
+    removed_tags: tuple[str, ...]
+    remaining_tags: tuple[str, ...]
+
+
 class ExifToolSidecarWriter:
     def __init__(self, exiftool: Path) -> None:
         self.exiftool = exiftool
@@ -137,3 +144,84 @@ class ExifToolSidecarWriter:
             temp_path.unlink(missing_ok=True)
 
         return MetadataWriteResult(sidecar, tuple(new_tags), tuple(existing_tags))
+
+    def remove_tags(self, video: Path, tags: list[str]) -> MetadataRemovalResult:
+        sidecar = self.sidecar_path(video)
+        if not sidecar.exists():
+            raise FileNotFoundError(f"sidecar does not exist: {sidecar}")
+
+        requested = []
+        seen: set[str] = set()
+        for tag in tags:
+            validated = validate_tag_path(tag)
+            if validated.casefold() not in seen:
+                requested.append(validated)
+                seen.add(validated.casefold())
+
+        fields = self.read_tag_fields(sidecar)
+        current_tags_list = set(fields["TagsList"])
+        to_remove = [tag for tag in requested if tag in current_tags_list]
+        if not to_remove:
+            return MetadataRemovalResult(
+                sidecar, (), tuple(sorted(fields["TagsList"], key=str.casefold))
+            )
+
+        # dc:Subject stores flat leaf names shared across every hierarchical tag.
+        # Only retract a leaf when no remaining tag still references it, so removing
+        # a tool-owned placeholder never strips a Subject value owned by another tag.
+        remaining_tags_list = current_tags_list - set(to_remove)
+        referenced_subject_leaves = {
+            tag.rsplit("/", 1)[-1] for tag in remaining_tags_list
+        }
+        subject_leaves_to_remove = {
+            tag.rsplit("/", 1)[-1]
+            for tag in to_remove
+            if tag.rsplit("/", 1)[-1] not in referenced_subject_leaves
+        }
+
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{sidecar.name}.", suffix=".xmp", dir=sidecar.parent
+        )
+        os.close(descriptor)
+        temp_path = Path(temp_name)
+        try:
+            shutil.copy2(sidecar, temp_path)
+            args: list[str | Path] = [
+                self.exiftool,
+                "-m",
+                "-overwrite_original",
+            ]
+            for tag in to_remove:
+                args.extend(
+                    [
+                        f"-XMP-digiKam:TagsList-={tag}",
+                        f"-XMP-lr:HierarchicalSubject-={tag.replace('/', '|')}",
+                    ]
+                )
+            for leaf in sorted(subject_leaves_to_remove, key=str.casefold):
+                args.append(f"-XMP-dc:Subject-={leaf}")
+            args.append(temp_path)
+            run_command(args, timeout=120)
+
+            written = self.read_tag_fields(temp_path)
+            tags_list = set(written["TagsList"])
+            hierarchical = set(written["HierarchicalSubject"])
+            subjects = set(written["Subject"])
+            remaining = sorted(tags_list, key=str.casefold)
+            for tag in to_remove:
+                if tag in tags_list:
+                    raise RuntimeError(f"ExifTool did not remove tag: {tag}")
+                hierarchical_expected = tag.replace("/", "|")
+                if hierarchical_expected in hierarchical:
+                    raise RuntimeError(
+                        f"ExifTool did not remove HierarchicalSubject: {hierarchical_expected}"
+                    )
+            for leaf in subject_leaves_to_remove:
+                if leaf in subjects:
+                    raise RuntimeError(f"ExifTool did not remove Subject: {leaf}")
+
+            os.replace(temp_path, sidecar)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+        return MetadataRemovalResult(sidecar, tuple(to_remove), tuple(remaining))

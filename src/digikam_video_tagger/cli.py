@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -11,6 +12,8 @@ import cv2
 import numpy as np
 
 from . import __version__
+from .autofinalize import AutoFinalizeOptions, AutoFinalizeService
+from .clustering import CLUSTER_STORE_NAME, FaceClusterStore
 from .config import (
     DEFAULT_DB_HOST,
     DEFAULT_DB_NAME,
@@ -42,6 +45,7 @@ from .metadata import ExifToolSidecarWriter
 from .models import FaceTagger, YoloObjectTagger, select_opencv_target
 from .pipeline import AnalysisResult, VideoTaggingPipeline
 from .process import run_command
+from .tags import validate_tag_path
 
 
 def _path(value: str) -> Path:
@@ -56,6 +60,17 @@ def _database_config(args: argparse.Namespace) -> DatabaseConfig:
     return DatabaseConfig(
         args.db_host, args.db_port, args.db_user, args.db_password, args.db_name
     )
+
+
+def _model_fingerprint(model_path: Path) -> str:
+    digest = hashlib.sha256()
+    with model_path.open("rb") as handle:
+        while True:
+            chunk = handle.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _require_cuda(args: argparse.Namespace) -> bool:
@@ -499,7 +514,9 @@ def finalize(args: argparse.Namespace) -> int:
                 if args.apply:
                     if people:
                         print(f"  sidecar={payload['sidecar']}")
-                    print("  generated proxy frames deleted; rescan the staging album in digiKam")
+                    print(
+                        "  generated proxy frames deleted; rescan the staging album in digiKam"
+                    )
         except Exception as error:
             failures += 1
             print(
@@ -624,6 +641,146 @@ def tag(args: argparse.Namespace) -> int:
             failures += 1
             print(f"[ERROR] {video}: {error}", file=sys.stderr)
     return 1 if failures else 0
+
+
+def autofinalize(args: argparse.Namespace) -> int:
+    paths = _tool_paths(args)
+    videos = _discover_videos(args.paths, args.recursive)
+    if not videos:
+        print("No supported video files found.", file=sys.stderr)
+        return 2
+
+    try:
+        validate_tag_path(args.unknown_root)
+    except ValueError as error:
+        print(f"Invalid unknown root: {error}", file=sys.stderr)
+        return 2
+
+    target = select_opencv_target(require_opencl=_require_opencl(args))
+    gallery = (
+        [] if args.no_people else DigiKamFaceGallery(_database_config(args)).load()
+    )
+    face_tagger = FaceTagger(
+        paths.yunet,
+        paths.sface,
+        target,
+        gallery,
+        detection_threshold=args.face_confidence,
+        recognition_distance=args.person_distance,
+    )
+
+    cluster_store_path = args.staging_dir / CLUSTER_STORE_NAME
+    model_fingerprint = _model_fingerprint(paths.sface)
+    try:
+        if cluster_store_path.is_file():
+            cluster_store = FaceClusterStore.load(
+                cluster_store_path,
+                model_fingerprint=model_fingerprint,
+                distance_threshold=args.cluster_distance,
+                unknown_root=args.unknown_root,
+            )
+        else:
+            cluster_store = FaceClusterStore.empty(
+                model_fingerprint=model_fingerprint,
+                distance_threshold=args.cluster_distance,
+                unknown_root=args.unknown_root,
+            )
+    except ValueError as error:
+        print(f"Cannot load face cluster store: {error}", file=sys.stderr)
+        return 2
+
+    options = AutoFinalizeOptions(
+        sample_seconds=args.sample_seconds,
+        max_frames=args.max_frames,
+        max_dimension=args.max_dimension,
+        min_person_hits=args.min_person_hits,
+        min_frame_ratio=args.min_frame_ratio,
+        resolution_min_observations=args.resolution_min_observations,
+        resolution_margin=args.resolution_margin,
+    )
+    service = AutoFinalizeService(
+        staging_dir=args.staging_dir,
+        sampler=FFmpegSampler(
+            paths.ffmpeg, paths.ffprobe, require_cuda=_require_cuda(args)
+        ),
+        face_tagger=face_tagger,
+        cluster_store=cluster_store,
+        cluster_store_path=cluster_store_path,
+        sidecar_writer=ExifToolSidecarWriter(paths.exiftool),
+        options=options,
+    )
+
+    results, summary = service.run(
+        videos, apply=args.apply, reprocess_completed=args.reprocess_completed
+    )
+    for result in results:
+        payload = {
+            "type": "video",
+            "source_video": str(result.source_video),
+            "job_id": result.job_id,
+            "frame_count": result.frame_count,
+            "unreadable_frames": result.unreadable_frames,
+            "face_frames": result.face_frames,
+            "known_people": list(result.known_people),
+            "placeholder_people": list(result.placeholder_people),
+            "proposed_replacements": [
+                list(pair) for pair in result.proposed_replacements
+            ],
+            "completed": result.completed,
+            "applied": result.applied,
+            "sidecar": str(result.sidecar) if result.sidecar else None,
+            "removed_proxy_files": result.removed_proxy_files,
+            "error": result.error,
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        elif not args.summary_only:
+            mode = "APPLIED" if result.applied else "DRY-RUN"
+            status = f"[{mode}]"
+            if result.error:
+                status = "[ERROR]"
+            print(f"{status} {result.source_video}")
+            if result.error:
+                print(f"  error={result.error}", file=sys.stderr)
+            else:
+                print(
+                    f"  frames={result.frame_count}, "
+                    f"unreadable={result.unreadable_frames}, "
+                    f"face_frames={result.face_frames}"
+                )
+                if result.known_people:
+                    print(f"  known={', '.join(result.known_people)}")
+                if result.placeholder_people:
+                    print(f"  placeholders={', '.join(result.placeholder_people)}")
+                if result.proposed_replacements:
+                    for placeholder, name in result.proposed_replacements:
+                        print(f"  proposed: {placeholder} -> {name}")
+                if result.sidecar:
+                    print(f"  sidecar={result.sidecar}")
+
+    summary_payload = {
+        "type": "summary",
+        "command": "autofinalize",
+        "videos": summary.videos,
+        "applied": summary.applied,
+        "completed": summary.completed,
+        "known_people": summary.known_people,
+        "clustered_people": summary.clustered_people,
+        "resolved_people": summary.resolved_people,
+        "failed": summary.failed,
+    }
+    if args.json:
+        print(json.dumps(summary_payload, ensure_ascii=False))
+    else:
+        print(
+            "Autofinalize summary: "
+            f"{summary.videos} video(s), {summary.applied} applied, "
+            f"{summary.completed} completed, {summary.known_people} known, "
+            f"{summary.clustered_people} clustered, "
+            f"{summary.resolved_people} resolved, {summary.failed} failed."
+        )
+
+    return 1 if summary.failed else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -776,6 +933,66 @@ def build_parser() -> argparse.ArgumentParser:
     tag_parser.add_argument("--no-faces", action="store_true")
     tag_parser.add_argument("--no-people", action="store_true")
     tag_parser.set_defaults(handler=tag)
+
+    autofinalize_parser = subparsers.add_parser(
+        "autofinalize",
+        help="Recognize known people, cluster unknown faces, and write People tags to XMP sidecars",
+    )
+    _add_shared_options(autofinalize_parser)
+    autofinalize_parser.add_argument(
+        "paths",
+        nargs="+",
+        type=_path,
+        help="Video file(s) or directory tree(s); directories recurse by default",
+    )
+    autofinalize_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write sidecars, save cluster state, record completion, and remove proxies",
+    )
+    autofinalize_parser.add_argument(
+        "--recursive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Recurse through every supplied directory (default: enabled)",
+    )
+    autofinalize_parser.add_argument("--json", action="store_true")
+    autofinalize_parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Suppress per-video detail and print only aggregate state",
+    )
+    autofinalize_parser.add_argument(
+        "--staging-dir",
+        type=_path,
+        default=DEFAULT_STAGING_DIR,
+        help=argparse.SUPPRESS,
+    )
+    autofinalize_parser.add_argument(
+        "--reprocess-completed",
+        action="store_true",
+        help="Regenerate proxies even when an unchanged video is in the completion ledger",
+    )
+    autofinalize_parser.add_argument("--sample-seconds", type=float, default=5.0)
+    autofinalize_parser.add_argument("--max-frames", type=int, default=120)
+    autofinalize_parser.add_argument("--max-dimension", type=int, default=1280)
+    autofinalize_parser.add_argument("--face-confidence", type=float, default=0.70)
+    autofinalize_parser.add_argument("--person-distance", type=float, default=0.50)
+    autofinalize_parser.add_argument("--cluster-distance", type=float, default=0.20)
+    autofinalize_parser.add_argument("--min-person-hits", type=int, default=2)
+    autofinalize_parser.add_argument("--min-frame-ratio", type=float, default=0.05)
+    autofinalize_parser.add_argument(
+        "--resolution-min-observations", type=int, default=2
+    )
+    autofinalize_parser.add_argument("--resolution-margin", type=float, default=0.10)
+    autofinalize_parser.add_argument("--unknown-root", default="People/Unknown")
+    autofinalize_parser.add_argument(
+        "--no-people",
+        action="store_true",
+        help="Disable gallery matching; still detect and cluster unknown faces",
+    )
+    autofinalize_parser.set_defaults(handler=autofinalize)
+
     return parser
 
 

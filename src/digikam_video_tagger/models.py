@@ -16,6 +16,13 @@ class OpenCVTarget:
     name: str
 
 
+@dataclass(frozen=True)
+class FaceDetection:
+    name: str | None
+    confidence: float
+    embedding: np.ndarray
+
+
 def select_opencv_target(require_opencl: bool = True) -> OpenCVTarget:
     have_opencl = bool(cv2.ocl.haveOpenCL())
     if have_opencl:
@@ -143,37 +150,65 @@ class FaceTagger:
         self.gallery = gallery
         self.recognition_distance = recognition_distance
 
-    def detect(self, image: np.ndarray) -> tuple[int, dict[str, float]]:
+    def _face_observations(
+        self, image: np.ndarray, *, include_unnamed: bool
+    ) -> tuple[int, list[FaceDetection]]:
         height, width = image.shape[:2]
         self.detector.setInputSize((width, height))
         _, faces = self.detector.detect(image)
         if faces is None or len(faces) == 0:
-            return 0, {}
+            return 0, []
+        if not include_unnamed and not self.gallery:
+            return len(faces), []
 
-        people: dict[str, float] = {}
-        if not self.gallery:
-            return len(faces), people
-
+        observations: list[FaceDetection] = []
         for face in faces:
             aligned = self.recognizer.alignCrop(image, face)
             feature = self.recognizer.feature(aligned).reshape(-1).astype(np.float32)
             norm = float(np.linalg.norm(feature))
-            if norm <= 0:
+            if norm <= 0 or feature.shape[0] != 128:
                 continue
             feature /= norm
+
             best: PersonEmbedding | None = None
             best_distance = float("inf")
-            for sample in self.gallery:
-                distance = 1.0 - float(np.dot(feature, sample.vector))
-                l2_distance = float(np.linalg.norm(feature - sample.vector))
-                if (
-                    distance < self.recognition_distance
-                    and l2_distance < 1.05
-                    and distance < best_distance
-                ):
-                    best = sample
-                    best_distance = distance
+            if self.gallery:
+                for sample in self.gallery:
+                    distance = 1.0 - float(np.dot(feature, sample.vector))
+                    l2_distance = float(np.linalg.norm(feature - sample.vector))
+                    if (
+                        distance < self.recognition_distance
+                        and l2_distance < 1.05
+                        and distance < best_distance
+                    ):
+                        best = sample
+                        best_distance = distance
+
             if best is not None:
                 confidence = max(0.0, min(1.0, 1.0 - best_distance))
-                people[best.name] = max(people.get(best.name, 0.0), confidence)
-        return len(faces), people
+                observations.append(
+                    FaceDetection(
+                        name=best.name, confidence=confidence, embedding=feature
+                    )
+                )
+            elif include_unnamed:
+                confidence = float(face[-1]) if len(face) > 0 else 0.0
+                observations.append(
+                    FaceDetection(name=None, confidence=confidence, embedding=feature)
+                )
+
+        return len(faces), observations
+
+    def detect_faces(self, image: np.ndarray) -> list[FaceDetection]:
+        _, detections = self._face_observations(image, include_unnamed=True)
+        return detections
+
+    def detect(self, image: np.ndarray) -> tuple[int, dict[str, float]]:
+        face_count, detections = self._face_observations(image, include_unnamed=False)
+        people: dict[str, float] = {}
+        for detection in detections:
+            if detection.name is not None:
+                people[detection.name] = max(
+                    people.get(detection.name, 0.0), detection.confidence
+                )
+        return face_count, people

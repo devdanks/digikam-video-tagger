@@ -19,11 +19,11 @@
 
 ## Architecture
 
-This is a **linear CLI metadata-bridge tool**, not a service or layered app. No web/API/ORM layer. Single entry point: `digikam-video-tagger` → `cli:main` → argparse with **five** subcommands. Two independent workflows share common primitives.
+This is a **linear CLI metadata-bridge tool**, not a service or layered app. No web/API/ORM layer. Single entry point: `digikam-video-tagger` → `cli:main` → argparse with **six** subcommands. Three independent workflows share common primitives.
 
 ### The key inversion (read this first)
 
-The *primary* workflow (`prepare`/`status`/`finalize`) deliberately does **not** run ML face recognition. It extracts proxy frames, hands them to digiKam's native People workflow, and reads back **confirmed** face regions from the digiKam DB. The ML pipeline (`models.py`, `pipeline.py`, `evidence.py`) powers only the *secondary*, experimental `tag` command. **digikKam is the recognition authority; this tool is a safe sidecar-writing bridge.**
+The *primary* workflow (`prepare`/`status`/`finalize`) deliberately does **not** run ML face recognition. It extracts proxy frames, hands them to digiKam's native People workflow, and reads back **confirmed** face regions from the digiKam DB. The ML pipeline (`models.py`, `pipeline.py`, `evidence.py`) powers the *secondary*, experimental `tag` command, and the *tertiary* `autofinalize` workflow (`autofinalize.py`, `clustering.py`) runs YuNet/SFace in-process to recognize known people and cluster unknown faces into persistent placeholders. **digiKam remains the face-recognition authority for confirmed tags; this tool is a safe sidecar-writing bridge.**
 
 ### Shared primitives
 
@@ -33,10 +33,12 @@ The *primary* workflow (`prepare`/`status`/`finalize`) deliberately does **not**
 | `config.py` | Env-driven defaults (`DIGIKAM_VIDEO_TAGGER_*`), `ToolPaths`, `DatabaseConfig`, `read_kconfig_boolean` (digikamrc INI). |
 | `ffmpeg.py` | `FFmpegSampler` — CPU `select,scale` frame extraction with optional CUDA prerequisite validation; `sampling_filter` builds CPU and standalone CUDA graphs. |
 | `digikam_db.py` | `DigiKamCatalog` (confirmed faces) + `DigiKamFaceGallery` (SFace embeddings) — raw parameterized SQL, read-only. |
-| `metadata.py` | `ExifToolSidecarWriter` — the **only** write path to disk outside the job store; atomic tempfile + `os.replace`. |
-| `jobs.py` | `VideoFaceJob` manifest, `CompletedVideo` ledger, `prepare_job`, `discover_jobs`, `mark_job_completed`, manifest-owned `remove_generated_files`. |
-| `evidence.py` | `EvidenceAccumulator` / `TagEvidence` — per-label hit + frame-ratio gating (`tag` only). |
-| `models.py` | `YoloObjectTagger`, `FaceTagger`, `select_opencv_target` (OpenCL/CPU DNN). |
+| `metadata.py` | `ExifToolSidecarWriter` — the **only** write path to disk outside the job store; atomic tempfile + `os.replace`, merge-only tags plus exact managed-tag removal. |
+| `jobs.py` | `VideoFaceJob` manifest, `CompletedVideo` ledger (v2 with managed-placeholder ownership), `prepare_job`, `discover_jobs`, `mark_job_completed`, `rewrite_completed_entry`, manifest-owned `remove_generated_files`, and `staging_apply_lock`. |
+| `evidence.py` | `EvidenceAccumulator` / `TagEvidence` — per-label hit + frame-ratio gating (`tag` and `autofinalize`). |
+| `models.py` | `YoloObjectTagger`, `FaceTagger` (with gallery-independent `detect_faces()`), `select_opencv_target` (OpenCL/CPU DNN). |
+| `clustering.py` | `FaceClusterStore` / `ClusterSession` — validated persistent unknown-face clusters, provisional per-video assignment, accepted-only commits, SFace model fingerprint, known-person resolution candidates. |
+| `autofinalize.py` | `AutoFinalizeService` — frame acquisition, per-frame evidence, cluster commit/save before sidecar reference, completion, cleanup, and ledger-owned placeholder replacement. |
 | `pipeline.py` | `VideoTaggingPipeline.analyze` — extract → detect per frame → evidence gate → write_tags (`tag` only). |
 | `tags.py` | Central People and automatic-video tag vocabulary helpers. |
 
@@ -52,7 +54,31 @@ cli.finalize → jobs.discover_jobs → DigiKamCatalog.confirmed_faces_for_frame
 
 `status` reuses `cli.finalize` with `apply=False, summary_only=True, status_mode=True` (set in `build_parser`). No separate handler.
 
-### Flow B — Direct auto-tag (`tag`)
+### Flow B — Automated People (`autofinalize`)
+
+```
+cli.autofinalize → select_opencv_target → DigiKamFaceGallery.load (unless --no-people)
+                 → FaceTagger constructed
+                 → FaceClusterStore.load (or empty) keyed to SFace fingerprint
+                 → AutoFinalizeService.run(videos, apply)
+                     → resolution sweep (dry-run reports; apply writes under staging_apply_lock)
+                     → per video:
+                         → prepare_job / dry-run extract_frames
+                         → per proxy frame: cv2.imread + FaceTagger.detect_faces
+                         → EvidenceAccumulator.add_frame exactly once per frame
+                         → accepted known → People/<name>
+                         → accepted unknown → ClusterSession.assign/commit → People/Unknown/Person_NNN
+                         → cluster save before sidecar reference
+                         → ExifToolSidecarWriter.write_tags
+                         → jobs.mark_job_completed with managed placeholders
+                         → job.remove_generated_files
+```
+
+Resolution uses stored centroids and ledger ownership; it does not require reprocessing completed
+videos. Placeholder replacement is only allowed for placeholders recorded in version-2 completion
+entries whose `cluster_store_id` matches the current store.
+
+### Flow C — Direct auto-tag (`tag`)
 
 ```
 cli.tag → select_opencv_target → DigiKamFaceGallery.load (unless --no-people)
@@ -66,7 +92,7 @@ cli.tag → select_opencv_target → DigiKamFaceGallery.load (unless --no-people
 
 ### Where logic lives
 
-Business orchestration lives in `cli.py` — arg parsing, batch loops, JSON payload assembly, human output, and exit codes. Domain value objects are frozen dataclasses in their own modules. There is **no service/repository abstraction**: `cli.py` constructs concrete classes directly and `digikam_db.py` issues inline SQL.
+Business orchestration lives in `cli.py` — arg parsing, batch loops, JSON payload assembly, human output, and exit codes. Domain value objects are frozen dataclasses in their own modules. The `autofinalize` workflow introduces a focused service, `AutoFinalizeService`, in `autofinalize.py` because the apply ordering, recovery, and placeholder-resolution logic is too large and safety-critical to inline in `cli.py`. `cli.py` still constructs dependencies and formats results. `digikam_db.py` issues inline parameterized SQL.
 
 ## Conventions (Observed)
 
@@ -107,8 +133,11 @@ Business orchestration lives in `cli.py` — arg parsing, batch loops, JSON payl
 - digiKam DB is query-only (no INSERT/UPDATE/DELETE anywhere in `digikam_db.py`).
 - Video bytes/timestamps are never modified; sidecar is `<video>.xmp`.
 - Sidecar writes are atomic (tempfile + `os.replace`); existing embedded and sidecar tags are deduplicated with ExifTool `nodups=1`, and `TagsList`, `HierarchicalSubject`, and `Subject` are all read back before replacement.
+- Exact managed-tag removal (`ExifToolSidecarWriter.remove_tags`) is only allowed for tag paths proven tool-owned by the version-2 completion ledger.
 - Cleanup is manifest-bound: `remove_generated_files` asserts each `resolved.parent == job_root` before unlink, then removes only manifest-named frames + their `.xmp` + the manifest.
 - Rerun skip: `source_is_unchanged` compares `st_size` + `st_mtime_ns`; completion ledger keyed by `job_id` (sha256 of resolved path).
+- Cluster store is keyed to the SFace model fingerprint; a changed model is rejected rather than silently reused.
+- `autofinalize --apply` refuses concurrent writers for the same staging directory via `staging_apply_lock`.
 
 ## Signals / Active Considerations
 
@@ -126,8 +155,8 @@ uv run digikam-video-tagger --version
 
 # Architectural invariants (grep-based structure checks)
 grep -Lni "insert into\|update .*set\|delete from\|drop \|alter " src/digikam_video_tagger/digikam_db.py  # DB never writes (expect filename printed = no match)
-grep -c "os.replace" src/digikam_video_tagger/metadata.py src/digikam_video_tagger/jobs.py  # atomic writes (expect 1 and 2)
+grep -c "os.replace" src/digikam_video_tagger/metadata.py src/digikam_video_tagger/jobs.py src/digikam_video_tagger/clustering.py  # atomic writes (expect ≥1 each)
 grep -c "resolved.parent != job_root" src/digikam_video_tagger/jobs.py                 # manifest-bound cleanup guard (expect 1)
-grep -cE "^def (doctor|prepare|finalize|tag)\b" src/digikam_video_tagger/cli.py         # 4 handlers; status reuses finalize
+grep -cE "^def (doctor|prepare|finalize|tag|autofinalize)\b" src/digikam_video_tagger/cli.py  # 5 handlers; status reuses finalize
 grep -c "^## " specs/tech-architecture/tech-stack.md                                   # this doc has ≥5 sections
 ```

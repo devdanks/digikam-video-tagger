@@ -1,3 +1,5 @@
+# ruff: noqa: TRY004
+
 from __future__ import annotations
 
 import hashlib
@@ -5,17 +7,21 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .ffmpeg import FFmpegSampler, VideoInfo
+from .tags import validate_tag_path
 
 MANIFEST_NAME = ".digikam-video-face-job.json"
 MANIFEST_VERSION = 1
 COMPLETED_NAME = ".digikam-video-face-completed.json"
-COMPLETED_VERSION = 1
+COMPLETED_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -119,6 +125,10 @@ class CompletedVideo:
     applied_at: str
     people: tuple[str, ...]
     sidecar: str | None
+    workflow: str = "confirmed"
+    managed_placeholders: tuple[str, ...] = ()
+    managed_placeholder_root: str | None = None
+    cluster_store_id: str | None = None
 
     @property
     def source_path(self) -> Path:
@@ -150,16 +160,58 @@ def load_completed_videos(staging_dir: Path) -> dict[str, CompletedVideo]:
     if not ledger.is_file():
         return {}
     payload = json.loads(ledger.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != COMPLETED_VERSION:
+    schema_version = payload.get("schema_version")
+    if schema_version not in (1, COMPLETED_VERSION):
         raise ValueError(f"Unsupported completion ledger version in {ledger}")
-    return {
-        str(job_id): CompletedVideo(
+    result: dict[str, CompletedVideo] = {}
+    for job_id, entry in payload.get("videos", {}).items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"completion entry for {job_id} must be an object")
+
+        people = tuple(entry.get("people", []))
+        for tag in people:
+            validate_tag_path(tag)
+
+        if schema_version == 1:
+            managed_placeholders: tuple[str, ...] = ()
+            managed_placeholder_root: str | None = None
+            workflow = "confirmed"
+            cluster_store_id: str | None = None
+        else:
+            workflow = entry.get("workflow", "confirmed")
+            if not isinstance(workflow, str):
+                raise ValueError(f"workflow for {job_id} must be a string")
+            managed_placeholders = tuple(entry.get("managed_placeholders", []))
+            for tag in managed_placeholders:
+                validate_tag_path(tag)
+            managed_placeholder_root = entry.get("managed_placeholder_root")
+            if managed_placeholder_root is not None:
+                validate_tag_path(managed_placeholder_root)
+                root_prefix = f"{managed_placeholder_root}/"
+                for tag in managed_placeholders:
+                    if not tag.startswith(root_prefix):
+                        raise ValueError(
+                            f"managed placeholder {tag} must be a descendant of "
+                            f"{managed_placeholder_root}"
+                        )
+            cluster_store_id = entry.get("cluster_store_id")
+            if cluster_store_id is not None and not isinstance(cluster_store_id, str):
+                raise ValueError(f"cluster_store_id for {job_id} must be a string")
+
+        result[str(job_id)] = CompletedVideo(
             job_id=str(job_id),
-            people=tuple(entry.get("people", [])),
-            **{key: value for key, value in entry.items() if key != "people"},
+            source_video=entry["source_video"],
+            source_size=entry["source_size"],
+            source_mtime_ns=entry["source_mtime_ns"],
+            applied_at=entry["applied_at"],
+            people=people,
+            sidecar=entry.get("sidecar"),
+            workflow=workflow,
+            managed_placeholders=managed_placeholders,
+            managed_placeholder_root=managed_placeholder_root,
+            cluster_store_id=cluster_store_id,
         )
-        for job_id, entry in payload.get("videos", {}).items()
-    }
+    return result
 
 
 def completed_video_for_source(staging_dir: Path, video: Path) -> CompletedVideo | None:
@@ -175,12 +227,33 @@ def completed_video_for_source(staging_dir: Path, video: Path) -> CompletedVideo
 
 
 def mark_job_completed(
-    job: VideoFaceJob, people: list[str], sidecar: Path | None
+    job: VideoFaceJob,
+    people: list[str],
+    sidecar: Path | None,
+    *,
+    workflow: str = "confirmed",
+    managed_placeholders: tuple[str, ...] = (),
+    managed_placeholder_root: str | None = None,
+    cluster_store_id: str | None = None,
 ) -> CompletedVideo:
     staging_dir = job.job_dir.parent
     staging_dir.mkdir(parents=True, exist_ok=True)
-    ledger = staging_dir / COMPLETED_NAME
     existing = load_completed_videos(staging_dir)
+
+    for tag in people:
+        validate_tag_path(tag)
+    for tag in managed_placeholders:
+        validate_tag_path(tag)
+    if managed_placeholder_root is not None:
+        validate_tag_path(managed_placeholder_root)
+        root_prefix = f"{managed_placeholder_root}/"
+        for tag in managed_placeholders:
+            if not tag.startswith(root_prefix):
+                raise ValueError(
+                    f"managed placeholder {tag} must be a descendant of "
+                    f"{managed_placeholder_root}"
+                )
+
     entry = CompletedVideo(
         job_id=job.job_id,
         source_video=job.source_video,
@@ -189,8 +262,27 @@ def mark_job_completed(
         applied_at=datetime.now(UTC).isoformat(),
         people=tuple(sorted(set(people), key=str.casefold)),
         sidecar=str(sidecar) if sidecar is not None else None,
+        workflow=workflow,
+        managed_placeholders=managed_placeholders,
+        managed_placeholder_root=managed_placeholder_root,
+        cluster_store_id=cluster_store_id,
     )
-    existing[job.job_id] = entry
+    return _write_completed_entry(staging_dir, entry, existing)
+
+
+def rewrite_completed_entry(staging_dir: Path, entry: CompletedVideo) -> CompletedVideo:
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    existing = load_completed_videos(staging_dir)
+    return _write_completed_entry(staging_dir, entry, existing)
+
+
+def _write_completed_entry(
+    staging_dir: Path,
+    entry: CompletedVideo,
+    existing: dict[str, CompletedVideo],
+) -> CompletedVideo:
+    ledger = staging_dir / COMPLETED_NAME
+    existing[entry.job_id] = entry
     payload = {
         "schema_version": COMPLETED_VERSION,
         "videos": {
@@ -213,6 +305,37 @@ def mark_job_completed(
     finally:
         temp_ledger.unlink(missing_ok=True)
     return entry
+
+
+@contextmanager
+def staging_apply_lock(staging_dir: Path) -> Iterator[None]:
+    if sys.platform != "win32":
+        raise RuntimeError(
+            "Apply locking is only implemented on Windows in this release"
+        )
+    import msvcrt
+
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = staging_dir / ".digikam-video-tagger.lock"
+    handle = lock_path.open("a+b")
+    try:
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            raise RuntimeError(
+                f"Another apply operation is using staging directory: {staging_dir}"
+            ) from error
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        handle.close()
 
 
 def prepare_job(

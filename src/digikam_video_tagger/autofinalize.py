@@ -1,0 +1,545 @@
+from __future__ import annotations
+
+import tempfile
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+import cv2
+
+from .clustering import FaceClusterStore
+from .evidence import EvidenceAccumulator
+from .ffmpeg import FFmpegSampler
+from .jobs import (
+    CompletedVideo,
+    PreparedJob,
+    VideoFaceJob,
+    discover_jobs,
+    job_id_for_video,
+    load_completed_videos,
+    mark_job_completed,
+    prepare_job,
+    rewrite_completed_entry,
+    staging_apply_lock,
+)
+from .metadata import ExifToolSidecarWriter, MetadataWriteResult
+from .models import FaceDetection, FaceTagger
+from .tags import people_tag
+
+
+@dataclass(frozen=True)
+class AutoFinalizeOptions:
+    sample_seconds: float
+    max_frames: int
+    max_dimension: int
+    min_person_hits: int
+    min_frame_ratio: float
+    resolution_min_observations: int = 2
+    resolution_margin: float = 0.1
+
+
+@dataclass(frozen=True)
+class AutoFinalizeVideoResult:
+    source_video: Path
+    job_id: str
+    frame_count: int
+    unreadable_frames: int
+    face_frames: int
+    known_people: tuple[str, ...]
+    placeholder_people: tuple[str, ...]
+    proposed_replacements: tuple[tuple[str, str], ...]
+    completed: bool
+    applied: bool
+    sidecar: Path | None
+    removed_proxy_files: int
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class AutoFinalizeSummary:
+    videos: int
+    applied: int
+    completed: int
+    known_people: int
+    clustered_people: int
+    resolved_people: int
+    failed: int
+
+
+class _DryRunFrames:
+    def __init__(
+        self,
+        frames: list[Path],
+        temp_dir: tempfile.TemporaryDirectory[str] | None,
+    ) -> None:
+        self.frames = frames
+        self._temp_dir = temp_dir
+
+    def cleanup(self) -> None:
+        if self._temp_dir is not None:
+            self._temp_dir.cleanup()
+
+
+class AutoFinalizeService:
+    def __init__(
+        self,
+        staging_dir: Path,
+        sampler: FFmpegSampler,
+        face_tagger: FaceTagger,
+        cluster_store: FaceClusterStore,
+        cluster_store_path: Path,
+        sidecar_writer: ExifToolSidecarWriter,
+        options: AutoFinalizeOptions,
+        *,
+        prepare_job: Callable[..., PreparedJob] = prepare_job,
+        discover_jobs: Callable[..., list[VideoFaceJob]] = discover_jobs,
+        load_completed: Callable[
+            [Path], dict[str, CompletedVideo]
+        ] = load_completed_videos,
+        mark_completed: Callable[..., CompletedVideo] = mark_job_completed,
+        job_id: Callable[[Path], str] = job_id_for_video,
+        lock: Callable[[Path], AbstractContextManager[None]] = staging_apply_lock,
+    ) -> None:
+        if options.sample_seconds <= 0:
+            raise ValueError("sample_seconds must be positive")
+        if options.max_frames <= 0:
+            raise ValueError("max_frames must be positive")
+        if options.max_dimension <= 0:
+            raise ValueError("max_dimension must be positive")
+        if options.min_person_hits < 1:
+            raise ValueError("min_person_hits must be positive")
+        if not 0.0 <= options.min_frame_ratio <= 1.0:
+            raise ValueError("min_frame_ratio must be between 0 and 1")
+        if options.resolution_min_observations < 1:
+            raise ValueError("resolution_min_observations must be positive")
+        if not 0.0 <= options.resolution_margin <= 1.0:
+            raise ValueError("resolution_margin must be between 0 and 1")
+
+        self.staging_dir = staging_dir
+        self.sampler = sampler
+        self.face_tagger = face_tagger
+        self.cluster_store = cluster_store
+        self.cluster_store_path = cluster_store_path
+        self.sidecar_writer = sidecar_writer
+        self.options = options
+        self.prepare_job = prepare_job
+        self.discover_jobs = discover_jobs
+        self.load_completed = load_completed
+        self.mark_completed = mark_completed
+        self.job_id = job_id
+        self.lock = lock
+
+    def run(
+        self,
+        videos: list[Path],
+        *,
+        apply: bool,
+        reprocess_completed: bool,
+    ) -> tuple[list[AutoFinalizeVideoResult], AutoFinalizeSummary]:
+        candidates = self._resolution_candidates()
+        results: list[AutoFinalizeVideoResult] = []
+        resolved_count = 0
+        if apply:
+            with self.lock(self.staging_dir):
+                resolved_count = self._apply_resolution(candidates)
+                for video in videos:
+                    result = self._process_video(
+                        video,
+                        apply=True,
+                        reprocess_completed=reprocess_completed,
+                    )
+                    results.append(result)
+        else:
+            for video in videos:
+                result = self._process_video(
+                    video, apply=False, reprocess_completed=reprocess_completed
+                )
+                result = self._attach_proposals(result, candidates)
+                results.append(result)
+
+        summary = AutoFinalizeSummary(
+            videos=len(results),
+            applied=sum(1 for r in results if r.applied),
+            completed=sum(1 for r in results if r.completed),
+            known_people=len({name for r in results for name in r.known_people}),
+            clustered_people=len(
+                {name for r in results for name in r.placeholder_people}
+            ),
+            resolved_people=sum(len(r.proposed_replacements) for r in results)
+            if not apply
+            else resolved_count,
+            failed=sum(1 for r in results if r.error is not None),
+        )
+        return results, summary
+
+    def _resolution_candidates(self) -> dict[str, str]:
+        if not self.face_tagger.gallery:
+            return {}
+        return self.cluster_store.resolution_candidates(
+            self.face_tagger.gallery,
+            recognition_distance=self.face_tagger.recognition_distance,
+            min_observations=self.options.resolution_min_observations,
+            min_margin=self.options.resolution_margin,
+        )
+
+    def _apply_resolution(self, candidates: dict[str, str]) -> int:
+        resolved_count = 0
+        failures: list[str] = []
+        for placeholder, name in candidates.items():
+            owners = self._owners_of_placeholder(placeholder)
+            placeholder_failed = False
+            for _job_id, entry in owners:
+                try:
+                    self._replace_placeholder(entry, placeholder, name)
+                except Exception as error:
+                    placeholder_failed = True
+                    failures.append(f"{placeholder} on {entry.source_path}: {error}")
+            if not placeholder_failed:
+                self._mark_cluster_resolved(placeholder, name)
+                resolved_count += 1
+        if failures:
+            raise RuntimeError(
+                "Placeholder resolution failed for "
+                f"{len(failures)} owner(s): " + "; ".join(failures)
+            )
+        return resolved_count
+
+    def _attach_proposals(
+        self,
+        result: AutoFinalizeVideoResult,
+        candidates: dict[str, str],
+    ) -> AutoFinalizeVideoResult:
+        proposals = [
+            (placeholder, candidates[placeholder])
+            for placeholder in result.placeholder_people
+            if placeholder in candidates
+        ]
+        if not proposals:
+            return result
+        from dataclasses import replace
+
+        return replace(result, proposed_replacements=tuple(proposals))
+
+    def _owners_of_placeholder(
+        self, placeholder: str
+    ) -> list[tuple[str, CompletedVideo]]:
+        owners: list[tuple[str, CompletedVideo]] = []
+        for job_id, entry in self.load_completed(self.staging_dir).items():
+            if entry.workflow != "autofinalize":
+                continue
+            if entry.cluster_store_id != self.cluster_store.store_id:
+                continue
+            if placeholder not in entry.managed_placeholders:
+                continue
+            if not entry.source_is_unchanged():
+                continue
+            owners.append((job_id, entry))
+        return owners
+
+    def _replace_placeholder(
+        self,
+        entry: CompletedVideo,
+        placeholder: str,
+        name: str,
+    ) -> None:
+        video = entry.source_path
+        known_tag = people_tag(name)
+        self.sidecar_writer.write_tags(video, [known_tag])
+        self.sidecar_writer.remove_tags(video, [placeholder])
+        updated_people = sorted(
+            {*entry.people, known_tag} - {placeholder},
+            key=str.casefold,
+        )
+        updated_placeholders = tuple(
+            p for p in entry.managed_placeholders if p != placeholder
+        )
+        new_entry = CompletedVideo(
+            job_id=entry.job_id,
+            source_video=entry.source_video,
+            source_size=entry.source_size,
+            source_mtime_ns=entry.source_mtime_ns,
+            applied_at=datetime.now(UTC).isoformat(),
+            people=tuple(updated_people),
+            sidecar=entry.sidecar,
+            workflow=entry.workflow,
+            managed_placeholders=updated_placeholders,
+            managed_placeholder_root=entry.managed_placeholder_root,
+            cluster_store_id=entry.cluster_store_id,
+        )
+        rewrite_completed_entry(self.staging_dir, new_entry)
+
+    def _mark_cluster_resolved(self, placeholder: str, name: str) -> None:
+        cluster_id = placeholder.rsplit("/", 1)[-1]
+        cluster = self.cluster_store.clusters.get(cluster_id)
+        if cluster is None:
+            return
+        cluster.resolved_name = name
+        self.cluster_store.save(self.cluster_store_path)
+
+    def _process_video(
+        self,
+        video: Path,
+        *,
+        apply: bool,
+        reprocess_completed: bool,
+    ) -> AutoFinalizeVideoResult:
+        video = video.resolve()
+        job_id = self.job_id(video)
+        active_job = self._active_job_for_video(video)
+
+        if apply and active_job is not None and not reprocess_completed:
+            completed = completed_video_for_source_with_loader(
+                self.staging_dir, video, self.load_completed
+            )
+            if (
+                completed is not None
+                and completed.cluster_store_id == self.cluster_store.store_id
+            ):
+                removed = active_job.remove_generated_files()
+                return AutoFinalizeVideoResult(
+                    source_video=video,
+                    job_id=job_id,
+                    frame_count=0,
+                    unreadable_frames=0,
+                    face_frames=0,
+                    known_people=completed.people,
+                    placeholder_people=completed.managed_placeholders,
+                    proposed_replacements=(),
+                    completed=True,
+                    applied=True,
+                    sidecar=Path(completed.sidecar) if completed.sidecar else None,
+                    removed_proxy_files=len(removed),
+                )
+
+        if active_job is None and not reprocess_completed:
+            completed = completed_video_for_source_with_loader(
+                self.staging_dir, video, self.load_completed
+            )
+            if completed is not None:
+                return AutoFinalizeVideoResult(
+                    source_video=video,
+                    job_id=job_id,
+                    frame_count=0,
+                    unreadable_frames=0,
+                    face_frames=0,
+                    known_people=completed.people,
+                    placeholder_people=completed.managed_placeholders,
+                    proposed_replacements=(),
+                    completed=True,
+                    applied=False,
+                    sidecar=Path(completed.sidecar) if completed.sidecar else None,
+                    removed_proxy_files=0,
+                )
+
+        job: VideoFaceJob | None = None
+        dry_run: _DryRunFrames | None = None
+        try:
+            if apply:
+                prepared = self.prepare_job(
+                    video,
+                    self.staging_dir,
+                    self.sampler,
+                    sample_seconds=self.options.sample_seconds,
+                    max_frames=self.options.max_frames,
+                    max_dimension=self.options.max_dimension,
+                )
+                job = prepared.job
+                frames = job.frame_paths
+            else:
+                dry_run = self._dry_run_frames(video, active_job)
+                frames = dry_run.frames
+
+            analysis = self._analyze_frames(frames)
+
+            if not apply:
+                return self._build_dry_run_result(
+                    video, job_id, analysis, cluster_session=None
+                )
+
+            assert job is not None
+            return self._apply_analysis(video, job, analysis)
+        except Exception as error:
+            return AutoFinalizeVideoResult(
+                source_video=video,
+                job_id=job_id,
+                frame_count=0,
+                unreadable_frames=0,
+                face_frames=0,
+                known_people=(),
+                placeholder_people=(),
+                proposed_replacements=(),
+                completed=False,
+                applied=False,
+                sidecar=None,
+                removed_proxy_files=0,
+                error=str(error),
+            )
+        finally:
+            if dry_run is not None:
+                dry_run.cleanup()
+
+    def _active_job_for_video(self, video: Path) -> VideoFaceJob | None:
+        jobs = self.discover_jobs(self.staging_dir, sources={video})
+        return jobs[0] if jobs else None
+
+    def _dry_run_frames(
+        self, video: Path, active_job: VideoFaceJob | None
+    ) -> _DryRunFrames:
+        if active_job is not None:
+            return _DryRunFrames(active_job.frame_paths, None)
+        _info, frames, temp_dir = self.sampler.extract_frames(
+            video,
+            sample_seconds=self.options.sample_seconds,
+            max_frames=self.options.max_frames,
+            max_dimension=self.options.max_dimension,
+        )
+        return _DryRunFrames(frames, temp_dir)
+
+    def _analyze_frames(
+        self,
+        frames: list[Path],
+        *,
+        cluster_session=None,
+    ) -> _FrameAnalysis:
+        if cluster_session is None:
+            cluster_session = self.cluster_store.begin_session()
+        evidence = EvidenceAccumulator()
+        unreadable_frames = 0
+        face_frames = 0
+        for frame_path in frames:
+            image = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+            if image is None:
+                unreadable_frames += 1
+                evidence.add_frame({})
+                continue
+
+            detections = self.face_tagger.detect_faces(image)
+            frame_labels: dict[str, float] = {}
+            if detections:
+                face_frames += 1
+            for detection in detections:
+                token = self._token_for_detection(detection, cluster_session)
+                frame_labels[token] = max(
+                    frame_labels.get(token, 0.0), detection.confidence
+                )
+            evidence.add_frame(frame_labels)
+
+        accepted = evidence.accepted(
+            min_hits=self.options.min_person_hits,
+            min_frame_ratio=self.options.min_frame_ratio,
+        )
+        known_tokens = [ev for ev in accepted if ev.label.startswith("known:")]
+        unknown_tokens = {
+            ev.label for ev in accepted if not ev.label.startswith("known:")
+        }
+        known_people = sorted(
+            {ev.label.split(":", 1)[1] for ev in known_tokens},
+            key=str.casefold,
+        )
+        placeholder_map = cluster_session.commit(unknown_tokens)
+        placeholder_tags = sorted(placeholder_map.values(), key=str.casefold)
+
+        return _FrameAnalysis(
+            frame_count=len(frames),
+            unreadable_frames=unreadable_frames,
+            face_frames=face_frames,
+            known_people=tuple(people_tag(name) for name in known_people),
+            placeholder_people=tuple(placeholder_tags),
+            store_changed=bool(unknown_tokens),
+        )
+
+    def _token_for_detection(self, detection: FaceDetection, session) -> str:
+        if detection.name is not None:
+            return f"known:{detection.name}"
+        return session.assign(detection.embedding)
+
+    def _build_dry_run_result(
+        self,
+        video: Path,
+        job_id: str,
+        analysis: _FrameAnalysis,
+        cluster_session,
+    ) -> AutoFinalizeVideoResult:
+        return AutoFinalizeVideoResult(
+            source_video=video,
+            job_id=job_id,
+            frame_count=analysis.frame_count,
+            unreadable_frames=analysis.unreadable_frames,
+            face_frames=analysis.face_frames,
+            known_people=analysis.known_people,
+            placeholder_people=analysis.placeholder_people,
+            proposed_replacements=(),
+            completed=False,
+            applied=False,
+            sidecar=None,
+            removed_proxy_files=0,
+        )
+
+    def _apply_analysis(
+        self,
+        video: Path,
+        job: VideoFaceJob,
+        analysis: _FrameAnalysis,
+    ) -> AutoFinalizeVideoResult:
+        sidecar_path = self.sidecar_writer.sidecar_path(video)
+        if analysis.store_changed:
+            self.cluster_store.save(self.cluster_store_path)
+
+        final_tags = list(analysis.known_people) + list(analysis.placeholder_people)
+        write_result: MetadataWriteResult | None = None
+        if final_tags:
+            write_result = self.sidecar_writer.write_tags(video, final_tags)
+
+        self.mark_completed(
+            job,
+            final_tags,
+            sidecar_path if write_result is not None else None,
+            workflow="autofinalize",
+            managed_placeholders=analysis.placeholder_people,
+            managed_placeholder_root=self.cluster_store.unknown_root,
+            cluster_store_id=self.cluster_store.store_id,
+        )
+        removed = job.remove_generated_files()
+
+        return AutoFinalizeVideoResult(
+            source_video=video,
+            job_id=job.job_id,
+            frame_count=analysis.frame_count,
+            unreadable_frames=analysis.unreadable_frames,
+            face_frames=analysis.face_frames,
+            known_people=analysis.known_people,
+            placeholder_people=analysis.placeholder_people,
+            proposed_replacements=(),
+            completed=True,
+            applied=True,
+            sidecar=write_result.sidecar if write_result else sidecar_path,
+            removed_proxy_files=len(removed),
+        )
+
+
+@dataclass(frozen=True)
+class _FrameAnalysis:
+    frame_count: int
+    unreadable_frames: int
+    face_frames: int
+    known_people: tuple[str, ...]
+    placeholder_people: tuple[str, ...]
+    store_changed: bool
+
+
+def completed_video_for_source_with_loader(
+    staging_dir: Path,
+    video: Path,
+    loader: Callable[[Path], dict[str, CompletedVideo]],
+) -> CompletedVideo | None:
+    video = video.resolve()
+    entry = loader(staging_dir).get(job_id_for_video(video))
+    if (
+        entry is None
+        or entry.source_path.resolve() != video
+        or not entry.source_is_unchanged()
+    ):
+        return None
+    return entry

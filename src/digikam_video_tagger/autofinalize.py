@@ -140,8 +140,9 @@ class AutoFinalizeService:
     ) -> tuple[list[AutoFinalizeVideoResult], AutoFinalizeSummary]:
         candidates = self._resolution_candidates()
         results: list[AutoFinalizeVideoResult] = []
+        resolved_count = 0
         if apply:
-            with staging_apply_lock(self.staging_dir):
+            with self.lock(self.staging_dir):
                 resolved_count = self._apply_resolution(candidates)
                 for video in videos:
                     result = self._process_video(
@@ -326,6 +327,7 @@ class AutoFinalizeService:
                 )
 
         job: VideoFaceJob | None = None
+        job: VideoFaceJob | None = None
         try:
             if apply:
                 prepared = self.prepare_job(
@@ -351,6 +353,7 @@ class AutoFinalizeService:
                     video, job_id, analysis, cluster_session=None
                 )
 
+            assert job is not None
             return self._apply_analysis(video, job, analysis)
         except Exception as error:
             return AutoFinalizeVideoResult(

@@ -1,6 +1,8 @@
 # digiKam Video Tagger
 
-Tag video files through digiKam without modifying the video bytes or digiKam's database. All metadata is written atomically to adjacent XMP sidecars such as `video.mp4.xmp`.
+Tag video files through digiKam without writing to digiKam's database. ExifTool embeds XMP directly in writable video containers. When an adjacent sidecar such as `video.mp4.xmp` exists, the tool imports and verifies its XMP before moving the sidecar to the Windows Recycle Bin.
+
+Direct XMP embedding is supported for `.3g2`, `.3gp`, `.m4v`, `.mov`, and `.mp4`. Other video formats remain discoverable for analysis, but apply/embed operations fail safely without removing their sidecars or proxy jobs.
 
 ## Choose a workflow
 
@@ -8,6 +10,7 @@ Tag video files through digiKam without modifying the video bytes or digiKam's d
 |---|---|
 | Copy **confirmed digiKam People** tags to videos | `prepare` → digiKam face review → `status` → `finalize --apply` |
 | Add automatic object/face-presence tags | `tag --apply` |
+| Embed sidecars left by an earlier release | `embed` → `embed --apply` |
 
 The People workflow is the normal workflow. The automatic `tag` workflow does **not** create or confirm digiKam People regions.
 
@@ -31,14 +34,15 @@ FFmpeg and ExifTool are found from `PATH` automatically. Do not add example plac
 
 ### 2. Configure digiKam once
 
-1. Enable **XMP sidecar reading** in digiKam's Metadata settings.
-2. Add this automatically managed directory as a digiKam **Album Root**:
+Add this automatically managed directory as a digiKam **Album Root**:
 
    ```text
    %LOCALAPPDATA%\digikam-video-tagger\staging
    ```
 
 The staging location is fixed by the application. **Do not configure or choose a staging path.** It must be an Album Root so digiKam can catalog the temporary JPEG proxy frames.
+
+XMP sidecar reading is not required for source videos because successful apply operations embed metadata in the media and recycle the sidecar.
 
 ## Confirmed People workflow
 
@@ -80,17 +84,18 @@ uv run digikam-video-tagger finalize "G:\Videos" --apply
 
 `--apply` is a total-completion operation:
 
-- writes adjacent XMP sidecars for videos with confirmed People tags;
+- merges confirmed People tags into the source media's XMP fields;
+- imports any existing adjacent sidecar XMP without dropping embedded tags;
+- reads the media back and moves the sidecar to the Recycle Bin only after all expected XMP is present;
 - records fully catalogued videos with no confirmed People tags as reviewed;
 - removes all manifest-owned proxy frames and proxy job folders;
-- refuses to remove a video’s proxies if any of its frames are not catalogued.
+- refuses to remove a video's proxies if any frame is not catalogued or metadata embedding fails.
 
 Afterward, reread metadata for the source-video album in digiKam.
 
-### 5. Verify the written sidecars with ExifTool
+### 5. Verify the embedded media metadata with ExifTool
 
-Run this standard PowerShell command to inspect the People fields in every XMP sidecar under the
-video root:
+Run this standard PowerShell command to inspect the People fields embedded in each writable video under the video root:
 
 ```powershell
 # Uses the configured path when config.local.ps1 is loaded; otherwise uses PATH.
@@ -99,7 +104,8 @@ $exiftool = if ($env:DIGIKAM_VIDEO_TAGGER_EXIFTOOL) {
 } else {
   (Get-Command exiftool -ErrorAction Stop).Source
 }
-Get-ChildItem -LiteralPath 'G:\Videos' -Recurse -File -Filter '*.xmp' |
+Get-ChildItem -LiteralPath 'G:\Videos' -Recurse -File |
+  Where-Object { $_.Extension -in '.3g2', '.3gp', '.m4v', '.mov', '.mp4' } |
   ForEach-Object {
     & $exiftool -G1 -s -FileName `
       -XMP-digiKam:TagsList `
@@ -117,6 +123,23 @@ For each person, the output should agree across all three fields. For example:
 [XMP-dc]      Subject             : Shelby
 ```
 
+## Existing sidecars (`embed`)
+
+Use this migration workflow for adjacent `.xmp` files created by an earlier release. Preview first:
+
+```powershell
+. .\config.local.ps1
+uv run digikam-video-tagger embed "G:\Videos"
+```
+
+The preview does not write or remove anything. Check that the expected files report `READY`, then apply:
+
+```powershell
+uv run digikam-video-tagger embed "G:\Videos" --apply
+```
+
+For each writable video, `embed --apply` imports portable sidecar XMP fields that are absent from the media, preserves existing non-tag values, merges the three tag lists, verifies every imported value with ExifTool, and only then sends the sidecar to the Recycle Bin. A failed or unsupported file keeps its sidecar and causes exit code `1`.
+
 ## Automatic tags (`tag`)
 
 Use `tag` only when you want automatic object or face-presence tags rather than the reviewed People workflow:
@@ -125,18 +148,21 @@ Use `tag` only when you want automatic object or face-presence tags rather than 
 # Preview only — writes nothing.
 uv run digikam-video-tagger tag "G:\Videos"
 
-# Write Auto Tags/Video sidecars.
+# Embed Auto Tags/Video metadata in writable videos.
 uv run digikam-video-tagger tag "G:\Videos" --apply
 ```
 
-`tag` uses YOLOv11 for objects and YuNet/SFace for faces. It writes object tags under `Auto Tags/Video/Objects/...`, adds `Auto Tags/Video/Contains Faces` when appropriate, and can add recognized `People/<name>` labels from the SFace gallery. It does not create digiKam face regions or replace manual face confirmation.
+`tag` uses YOLOv11 for objects and YuNet/SFace for faces. It embeds object tags under `Auto Tags/Video/Objects/...`, adds `Auto Tags/Video/Contains Faces` when appropriate, and can add recognized `People/<name>` labels from the SFace gallery. It does not create digiKam face regions or replace manual face confirmation.
 
 ## Safety guarantees
 
 - digiKam database access is read-only.
-- Videos are never rewritten.
-- Metadata is merged into `video.ext.xmp` sidecars atomically.
-- Existing sidecar and embedded tags are preserved and deduplicated.
+- ExifTool rewrites only its supported media containers and preserves the filesystem modification time.
+- Existing embedded tag lists and sidecar tag lists are merged without adding duplicates.
+- Every imported sidecar XMP field and all three digiKam-compatible tag fields are read back from the media before cleanup.
+- Sidecars go to the Windows Recycle Bin only after successful verification; failures retain them.
+- If a controlled media write fails after changing the file, its active job fingerprint is refreshed so `finalize --apply` can retry; unrelated source changes are still rejected.
+- Unsupported media containers are never rewritten.
 - `finalize --apply` deletes only files listed in its validated proxy-job manifests.
 - A changed source video is not finalized from stale proxy frames.
 

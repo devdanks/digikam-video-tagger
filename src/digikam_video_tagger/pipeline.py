@@ -7,7 +7,7 @@ import cv2
 
 from .evidence import EvidenceAccumulator, TagEvidence
 from .ffmpeg import FFmpegSampler, VideoInfo
-from .metadata import ExifToolSidecarWriter, MetadataWriteResult
+from .metadata import ExifToolMetadataWriter, MetadataWriteResult
 from .models import FaceTagger, YoloObjectTagger
 from .tags import contains_faces_tag, object_tag, people_tag
 
@@ -31,7 +31,7 @@ class VideoTaggingPipeline:
         sampler: FFmpegSampler,
         object_tagger: YoloObjectTagger | None,
         face_tagger: FaceTagger | None,
-        sidecar_writer: ExifToolSidecarWriter,
+        metadata_writer: ExifToolMetadataWriter,
         *,
         tag_root: str = "Auto Tags/Video",
         sample_seconds: float = 5.0,
@@ -45,7 +45,7 @@ class VideoTaggingPipeline:
         self.sampler = sampler
         self.object_tagger = object_tagger
         self.face_tagger = face_tagger
-        self.sidecar_writer = sidecar_writer
+        self.metadata_writer = metadata_writer
         self.tag_root = tag_root.strip("/")
         self.sample_seconds = sample_seconds
         self.max_frames = max_frames
@@ -101,7 +101,7 @@ class VideoTaggingPipeline:
         tags.extend(people_tag(item.label) for item in people)
 
         metadata = (
-            self.sidecar_writer.write_tags(video, tags) if apply and tags else None
+            self.metadata_writer.write_tags(video, tags) if apply and tags else None
         )
         return AnalysisResult(
             video=video,

@@ -17,7 +17,6 @@ from .config import (
     DEFAULT_DB_PASSWORD,
     DEFAULT_DB_PORT,
     DEFAULT_DB_USER,
-    DEFAULT_DIGIKAM_CONFIG,
     DEFAULT_EXIFTOOL,
     DEFAULT_FFMPEG_DIR,
     DEFAULT_MODEL_DIR,
@@ -25,7 +24,6 @@ from .config import (
     VIDEO_EXTENSIONS,
     DatabaseConfig,
     ToolPaths,
-    digikam_sidecar_reading_enabled,
 )
 from .digikam_db import DigiKamCatalog, DigiKamFaceGallery
 from .ffmpeg import FFmpegSampler
@@ -37,8 +35,9 @@ from .jobs import (
     load_completed_videos,
     mark_job_completed,
     prepare_job,
+    refresh_job_source_fingerprint,
 )
-from .metadata import ExifToolSidecarWriter
+from .metadata import ExifToolMetadataWriter, MetadataWriteError
 from .models import FaceTagger, YoloObjectTagger, select_opencv_target
 from .pipeline import AnalysisResult, VideoTaggingPipeline
 from .process import run_command
@@ -190,16 +189,6 @@ def doctor(args: argparse.Namespace) -> int:
         checks.append(("ExifTool runtime", True, f"version {version}"))
     except Exception as error:
         checks.append(("ExifTool runtime", False, str(error)))
-
-    sidecar_reading = digikam_sidecar_reading_enabled(DEFAULT_DIGIKAM_CONFIG)
-    checks.append(
-        (
-            "digiKam sidecar reading",
-            sidecar_reading is True,
-            f"{DEFAULT_DIGIKAM_CONFIG}: "
-            + ("enabled" if sidecar_reading is True else "disabled or not configured"),
-        )
-    )
 
     try:
         regions, person_tags, embeddings = DigiKamCatalog(
@@ -399,7 +388,7 @@ def finalize(args: argparse.Namespace) -> int:
         return 2
 
     catalog = DigiKamCatalog(_database_config(args))
-    writer = ExifToolSidecarWriter(args.exiftool)
+    writer = ExifToolMetadataWriter(args.exiftool)
     total = len(jobs)
     failures = 0
     ready = 0
@@ -476,10 +465,20 @@ def finalize(args: argparse.Namespace) -> int:
             if args.apply:
                 payload["applied"] = True
                 if people:
-                    metadata = writer.write_tags(job.source_path, people)
-                    payload["sidecar"] = str(metadata.sidecar)
+                    try:
+                        metadata = writer.write_tags(job.source_path, people)
+                    except MetadataWriteError:
+                        refresh_job_source_fingerprint(job)
+                        raise
+                    payload["media"] = str(metadata.media)
+                    payload["sidecar"] = None
+                    payload["recycled_sidecar"] = (
+                        str(metadata.recycled_sidecar)
+                        if metadata.recycled_sidecar is not None
+                        else None
+                    )
                     payload["added_tags"] = list(metadata.added_tags)
-                    mark_job_completed(job, people, metadata.sidecar)
+                    mark_job_completed(job, people, None)
                     state = "APPLIED"
                 else:
                     mark_job_completed(job, [], None)
@@ -498,8 +497,12 @@ def finalize(args: argparse.Namespace) -> int:
                     print(f"  confirmed_people={', '.join(people)}")
                 if args.apply:
                     if people:
-                        print(f"  sidecar={payload['sidecar']}")
-                    print("  generated proxy frames deleted; rescan the staging album in digiKam")
+                        print(f"  media={payload['media']}")
+                        if payload["recycled_sidecar"] is not None:
+                            print(f"  sidecar_recycled={payload['recycled_sidecar']}")
+                    print(
+                        "  generated proxy frames deleted; rescan the staging album in digiKam"
+                    )
         except Exception as error:
             failures += 1
             print(
@@ -539,6 +542,90 @@ def finalize(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def embed(args: argparse.Namespace) -> int:
+    videos = _discover_videos(args.paths, args.recursive)
+    if not videos:
+        print("No supported video files found.", file=sys.stderr)
+        return 2
+
+    writer = ExifToolMetadataWriter(args.exiftool)
+    total = len(videos)
+    ready = 0
+    embedded = 0
+    skipped = 0
+    unsupported = 0
+    failures = 0
+    for index, video in enumerate(videos, start=1):
+        sidecar = writer.sidecar_path(video)
+        payload = {
+            "type": "video",
+            "index": index,
+            "total": total,
+            "media": str(video),
+            "sidecar": str(sidecar) if sidecar.is_file() else None,
+            "ready": sidecar.is_file(),
+            "applied": False,
+        }
+        try:
+            if not sidecar.is_file():
+                skipped += 1
+                state = "NO-SIDECAR"
+            elif not writer.supports_video(video):
+                unsupported += 1
+                payload["ready"] = False
+                state = "UNSUPPORTED"
+                if args.apply:
+                    failures += 1
+            elif args.apply:
+                metadata = writer.write_tags(video, [])
+                embedded += 1
+                payload["applied"] = True
+                payload["sidecar"] = None
+                payload["recycled_sidecar"] = (
+                    str(metadata.recycled_sidecar)
+                    if metadata.recycled_sidecar is not None
+                    else None
+                )
+                payload["added_tags"] = list(metadata.added_tags)
+                state = "EMBEDDED"
+            else:
+                ready += 1
+                state = "READY"
+
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False))
+            else:
+                print(f"[{index}/{total} {state}] {video}")
+                if args.apply and state == "EMBEDDED":
+                    print(f"  media={video}")
+                    if payload["recycled_sidecar"] is not None:
+                        print(f"  sidecar_recycled={payload['recycled_sidecar']}")
+        except Exception as error:
+            failures += 1
+            print(f"[{index}/{total} ERROR] {video}: {error}", file=sys.stderr)
+
+    summary = {
+        "type": "summary",
+        "command": "embed",
+        "videos": total,
+        "ready": ready,
+        "embedded": embedded,
+        "skipped": skipped,
+        "unsupported": unsupported,
+        "failed": failures,
+    }
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False))
+    else:
+        print(
+            "\nEmbed summary: "
+            f"{total} video(s), {ready} ready, {embedded} embedded, "
+            f"{skipped} without sidecars, {unsupported} unsupported, "
+            f"{failures} failed."
+        )
+    return 1 if failures else 0
+
+
 def _result_payload(result: AnalysisResult) -> dict:
     return {
         "video": str(result.video),
@@ -550,7 +637,13 @@ def _result_payload(result: AnalysisResult) -> dict:
         "objects": [asdict(item) for item in result.objects],
         "people": [asdict(item) for item in result.people],
         "tags": list(result.tags),
-        "sidecar": str(result.metadata.sidecar) if result.metadata else None,
+        "media": str(result.metadata.media) if result.metadata else None,
+        "sidecar": None,
+        "recycled_sidecar": (
+            str(result.metadata.recycled_sidecar)
+            if result.metadata and result.metadata.recycled_sidecar is not None
+            else None
+        ),
         "added_tags": list(result.metadata.added_tags) if result.metadata else [],
     }
 
@@ -592,7 +685,7 @@ def tag(args: argparse.Namespace) -> int:
         FFmpegSampler(paths.ffmpeg, paths.ffprobe, require_cuda=_require_cuda(args)),
         object_tagger,
         face_tagger,
-        ExifToolSidecarWriter(paths.exiftool),
+        ExifToolMetadataWriter(paths.exiftool),
         tag_root=args.tag_root,
         sample_seconds=args.sample_seconds,
         max_frames=args.max_frames,
@@ -619,7 +712,9 @@ def tag(args: argparse.Namespace) -> int:
                 )
                 print(f"  tags={', '.join(result.tags) if result.tags else '(none)'}")
                 if result.metadata:
-                    print(f"  sidecar={result.metadata.sidecar}")
+                    print(f"  media={result.metadata.media}")
+                    if result.metadata.recycled_sidecar is not None:
+                        print(f"  sidecar_recycled={result.metadata.recycled_sidecar}")
         except Exception as error:
             failures += 1
             print(f"[ERROR] {video}: {error}", file=sys.stderr)
@@ -703,7 +798,7 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_parser.add_argument(
         "--apply",
         action="store_true",
-        help="Finalize every fully catalogued job, write XMP sidecars, and remove proxies",
+        help="Finalize every fully catalogued job, embed XMP tags, and remove proxies",
     )
 
     finalize_parser.add_argument(
@@ -745,6 +840,31 @@ def build_parser() -> argparse.ArgumentParser:
         status_mode=True,
     )
 
+    embed_parser = subparsers.add_parser(
+        "embed",
+        help="Embed adjacent XMP sidecars in writable media and recycle them",
+    )
+    embed_parser.add_argument("--exiftool", type=_path, default=DEFAULT_EXIFTOOL)
+    embed_parser.add_argument(
+        "paths",
+        nargs="+",
+        type=_path,
+        help="Video file(s) or directory tree(s); directories recurse by default",
+    )
+    embed_parser.add_argument(
+        "--recursive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Recurse through every supplied directory (default: enabled)",
+    )
+    embed_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Embed and verify sidecar XMP, then move each sidecar to the Recycle Bin",
+    )
+    embed_parser.add_argument("--json", action="store_true")
+    embed_parser.set_defaults(handler=embed)
+
     tag_parser = subparsers.add_parser(
         "tag",
         help="Experimental direct object/face-presence tagging (does not populate People regions)",
@@ -752,7 +872,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_shared_options(tag_parser)
     tag_parser.add_argument("paths", nargs="+", type=_path)
     tag_parser.add_argument(
-        "--apply", action="store_true", help="Write merge-only XMP sidecars"
+        "--apply",
+        action="store_true",
+        help="Embed merge-only XMP tags in writable media",
     )
     tag_parser.add_argument(
         "--recursive", action=argparse.BooleanOptionalAction, default=True

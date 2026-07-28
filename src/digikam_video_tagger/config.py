@@ -44,10 +44,6 @@ DEFAULT_EXIFTOOL = _environment_path(
 # Proxy jobs are managed transient data. Keep them in an application-managed
 # location so they survive face review and can be deleted after finalization.
 DEFAULT_STAGING_DIR = LOCAL_APP_DATA / "digikam-video-tagger" / "staging"
-DEFAULT_DIGIKAM_CONFIG = _environment_path(
-    "DIGIKAM_VIDEO_TAGGER_DIGIKAM_CONFIG",
-    LOCAL_APP_DATA / "digikamrc",
-)
 DEFAULT_MODEL_DIR = _environment_path(
     "DIGIKAM_VIDEO_TAGGER_MODEL_DIR",
     LOCAL_APP_DATA / "digikam" / "facesengine",
@@ -57,42 +53,6 @@ DEFAULT_DB_PORT = _environment_int("DIGIKAM_VIDEO_TAGGER_DB_PORT", 3307)
 DEFAULT_DB_USER = os.environ.get("DIGIKAM_VIDEO_TAGGER_DB_USER", "root")
 DEFAULT_DB_PASSWORD = os.environ.get("DIGIKAM_VIDEO_TAGGER_DB_PASSWORD", "")
 DEFAULT_DB_NAME = os.environ.get("DIGIKAM_VIDEO_TAGGER_DB_NAME", "digikam")
-
-
-def read_kconfig_boolean(path: Path, section: str, key: str) -> bool | None:
-    """Read one boolean from a KDE-style INI file without rewriting it."""
-    if not path.is_file():
-        return None
-
-    wanted_section = section.casefold()
-    wanted_key = key.casefold()
-    current_section = ""
-    for raw_line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
-        line = raw_line.strip()
-        if line.startswith("[") and line.endswith("]"):
-            current_section = line[1:-1].strip().casefold()
-            continue
-        if current_section != wanted_section or "=" not in line:
-            continue
-        candidate, value = line.split("=", 1)
-        if candidate.strip().casefold() != wanted_key:
-            continue
-        normalized = value.strip().casefold()
-        if normalized in {"true", "yes", "on", "1"}:
-            return True
-        if normalized in {"false", "no", "off", "0"}:
-            return False
-        return None
-    return None
-
-
-def digikam_sidecar_reading_enabled(path: Path) -> bool | None:
-    """Read digiKam's sidecar-reading option across supported config key names."""
-    for key in ("Use XMP Sidecar For Reading", "UseXMPSidecar4Reading"):
-        value = read_kconfig_boolean(path, "Metadata Settings", key)
-        if value is not None:
-            return value
-    return None
 
 
 VIDEO_EXTENSIONS = frozenset(

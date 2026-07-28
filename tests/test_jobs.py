@@ -9,6 +9,7 @@ from digikam_video_tagger.jobs import (
     job_folder_name,
     job_id_for_video,
     mark_job_completed,
+    refresh_job_source_fingerprint,
 )
 
 
@@ -49,6 +50,83 @@ def test_completion_ledger_matches_only_unchanged_source(tmp_path: Path) -> None
 
     video.write_bytes(b"changed")
     assert completed_video_for_source(staging, video) is None
+
+
+def test_completion_ledger_records_source_after_metadata_embedding(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / "staging"
+    job_dir = staging / "job"
+    job_dir.mkdir(parents=True)
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    original_stat = video.stat()
+    job = VideoFaceJob(
+        schema_version=1,
+        job_id=job_id_for_video(video),
+        source_video=str(video.resolve()),
+        source_size=original_stat.st_size,
+        source_mtime_ns=original_stat.st_mtime_ns,
+        created_at="2026-01-01T00:00:00+00:00",
+        sample_seconds=5.0,
+        video_duration_seconds=1.0,
+        video_codec="h264",
+        frames=(),
+        job_dir=job_dir,
+    )
+    video.write_bytes(b"video with embedded XMP metadata")
+
+    mark_job_completed(job, ["People/Alice"], None)
+
+    assert completed_video_for_source(staging, video) is not None
+
+
+def test_refresh_job_source_fingerprint_makes_controlled_media_write_retryable(
+    tmp_path: Path,
+) -> None:
+    job_dir = tmp_path / "staging" / "job"
+    job_dir.mkdir(parents=True)
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    original_stat = video.stat()
+    job = VideoFaceJob(
+        schema_version=1,
+        job_id=job_id_for_video(video),
+        source_video=str(video.resolve()),
+        source_size=original_stat.st_size,
+        source_mtime_ns=original_stat.st_mtime_ns,
+        created_at="2026-01-01T00:00:00+00:00",
+        sample_seconds=5.0,
+        video_duration_seconds=1.0,
+        video_codec="h264",
+        frames=(),
+        job_dir=job_dir,
+    )
+    job.manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": job.schema_version,
+                "job_id": job.job_id,
+                "source_video": job.source_video,
+                "source_size": job.source_size,
+                "source_mtime_ns": job.source_mtime_ns,
+                "created_at": job.created_at,
+                "sample_seconds": job.sample_seconds,
+                "video_duration_seconds": job.video_duration_seconds,
+                "video_codec": job.video_codec,
+                "frames": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    video.write_bytes(b"video with partially embedded metadata")
+
+    refreshed = refresh_job_source_fingerprint(job)
+    reloaded = VideoFaceJob.load(job.manifest_path)
+
+    assert refreshed.source_is_unchanged()
+    assert reloaded.source_is_unchanged()
+    assert reloaded.source_size == video.stat().st_size
 
 
 def test_completion_ledger_supports_reviewed_video_without_people(

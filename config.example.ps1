@@ -6,7 +6,6 @@
 # $env:DIGIKAM_VIDEO_TAGGER_EXIFTOOL = 'C:\path\to\exiftool.exe'
 # Proxy staging is automatic: %LOCALAPPDATA%\digikam-video-tagger\staging.
 $env:DIGIKAM_VIDEO_TAGGER_MODEL_DIR = "$env:LOCALAPPDATA\digikam\facesengine"
-$env:DIGIKAM_VIDEO_TAGGER_DIGIKAM_CONFIG = "$env:LOCALAPPDATA\digikamrc"
 
 $env:DIGIKAM_VIDEO_TAGGER_DB_HOST = '127.0.0.1'
 $env:DIGIKAM_VIDEO_TAGGER_DB_PORT = '3307'

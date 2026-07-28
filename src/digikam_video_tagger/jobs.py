@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -174,6 +174,33 @@ def completed_video_for_source(staging_dir: Path, video: Path) -> CompletedVideo
     return entry
 
 
+def refresh_job_source_fingerprint(job: VideoFaceJob) -> VideoFaceJob:
+    """Persist a source state changed by this tool so a failed apply can be retried."""
+    if not job.manifest_path.is_file():
+        raise FileNotFoundError(job.manifest_path)
+    source_stat = job.source_path.stat()
+    refreshed = replace(
+        job,
+        source_size=source_stat.st_size,
+        source_mtime_ns=source_stat.st_mtime_ns,
+    )
+    payload = asdict(refreshed)
+    payload.pop("job_dir")
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=".manifest-refresh-", suffix=".json", dir=job.job_dir
+    )
+    os.close(descriptor)
+    temp_manifest = Path(temp_name)
+    try:
+        temp_manifest.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        os.replace(temp_manifest, job.manifest_path)
+    finally:
+        temp_manifest.unlink(missing_ok=True)
+    return refreshed
+
+
 def mark_job_completed(
     job: VideoFaceJob, people: list[str], sidecar: Path | None
 ) -> CompletedVideo:
@@ -181,11 +208,12 @@ def mark_job_completed(
     staging_dir.mkdir(parents=True, exist_ok=True)
     ledger = staging_dir / COMPLETED_NAME
     existing = load_completed_videos(staging_dir)
+    source_stat = job.source_path.stat()
     entry = CompletedVideo(
         job_id=job.job_id,
         source_video=job.source_video,
-        source_size=job.source_size,
-        source_mtime_ns=job.source_mtime_ns,
+        source_size=source_stat.st_size,
+        source_mtime_ns=source_stat.st_mtime_ns,
         applied_at=datetime.now(UTC).isoformat(),
         people=tuple(sorted(set(people), key=str.casefold)),
         sidecar=str(sidecar) if sidecar is not None else None,
